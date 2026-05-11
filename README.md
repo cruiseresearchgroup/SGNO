@@ -114,7 +114,3 @@ model = build_sgno_from_config(
 
 audit = summarize_gain_audit(model)
 ```
-
-## License
-
-MIT

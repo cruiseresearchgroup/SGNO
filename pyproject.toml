@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "Spectral Generator Neural Operator in PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
 dependencies = ["torch", "numpy"]
 keywords = ["neural-operator", "pde", "fourier", "etd"]
 
