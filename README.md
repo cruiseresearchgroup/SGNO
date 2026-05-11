@@ -2,101 +2,115 @@
 
 ![SGNO architecture](assets/sgno_arch.png)
 
-This repository provides a PyTorch reference implementation of the Spectral Generator Neural Operator (SGNO) for one step supervised training and long horizon autoregressive rollouts of PDE dynamics.
+This repository provides a PyTorch implementation of the Spectral Generator Neural Operator for one-step supervised training and long-horizon autoregressive PDE rollouts.
 
-SGNO maps a short history u_n to u_{n+1} by lifting inputs to a latent feature field, applying a stack of time advance blocks, and projecting back to the physical channels. Each time advance block performs a spectral exponential time differencing update with a learned diagonal generator and a phi1 weighted forcing term with per frequency channel mixing. Optional spectral truncation or smooth masking can be applied on the forcing pathway to suppress high frequency feedback.
+SGNO maps a current PDE state to the next state through a residual neural operator. The input state is lifted with coordinate features, passed through stacked SGNO blocks, and projected back to a physical-state increment. Each block uses a spectral evolution update with a real-valued nonpositive diagonal generator, complex spectral correction mixing, bounded injection budgets, and pointwise local mixing.
 
-## Repository structure
+The implementation targets periodic linear and semilinear evolution PDEs with Fourier-structured linear dynamics.
 
-src/sgno contains the model definitions and a thin wrapper that constructs grids internally and returns a residual update.
-scripts contains minimal entry points for sanity checking, training, and rollout evaluation.
-configs provides example configurations for 1D, 2D, and 3D regimes.
-assets contains figures used by this README.
-tests contains a small forward pass test.
+## Repository Structure
+
+`src/sgno` contains the model definitions and the wrapper used by the scripts.
+
+`scripts` contains minimal training, evaluation, and sanity-check entry points.
+
+`configs` contains canonical 1D, 2D, and 3D example settings.
+
+`tests` contains lightweight forward and audit checks.
 
 ## Installation
 
 Python 3.10 or newer is recommended.
 
-Install dependencies:
-
 ```bash
 pip install -r requirements.txt
-```
-
-Editable install:
-
-```bash
 pip install -e .
 ```
 
-Optional developer dependencies:
+Optional test dependency:
 
 ```bash
 pip install -r requirements_dev.txt
 ```
 
-## Quick sanity check
+## Quick Check
 
 ```bash
 python scripts/sanity_check.py
 ```
 
-## Data format
+## Data Format
 
-Training and evaluation scripts expect a NumPy NPZ file containing trajectories as float32 arrays.
+Training and evaluation scripts expect a NumPy NPZ file containing float32 trajectories.
 
 Accepted keys:
 
+```text
 train and test
-u and optionally test
+u
+```
 
 Layouts:
 
+```text
 1D: (N, T, C, X)
 2D: (N, T, C, X, Y)
 3D: (N, T, C, X, Y, Z)
+```
 
-The history length is initial_step. For each training sample, the model consumes u[t:t+initial_step] and predicts u[t+initial_step] with a residual update.
+The history length is `initial_step`. The canonical experiments use `initial_step=1`.
 
-## Reference configurations
+## Canonical Configurations
 
-The example configs mirror the default dimensional settings used in the paper level experiments.
+The public API exposes the canonical SGNO configuration string:
+
+```text
+sgno_canonical;width=<int>;modes=<int>;n_blocks=<int>;initial_step=<int>
+```
+
+Reference dimension-level settings:
+
+```text
+1D: sgno_canonical;width=11;modes=26;n_blocks=7;initial_step=1
+2D: sgno_canonical;width=5;modes=10;n_blocks=9;initial_step=1
+3D: sgno_canonical;width=10;modes=6;n_blocks=2;initial_step=1
+```
 
 ## Training
 
-One step supervised training minimizes MSE on the next state.
+One-step supervised training minimizes MSE on the next state.
 
 ```bash
 python scripts/train_npz.py --config configs/example_2d.json --data path/to/data.npz --out runs/example_2d
 ```
 
-The output directory contains best.pt and a small state.json.
+The output directory contains `best.pt` and `state.json`.
 
-## Evaluation and paper metrics
+## Evaluation
 
-Autoregressive rollouts initialize from the first test frames and repeatedly apply the learned one step map. The evaluation script reports rollout metrics aligned with the paper.
-
-
-Stable step with threshold tau is the first t where nRMSE(t) > tau. Non finite values are treated as crossing at their first occurrence. If the threshold is never crossed, stable step is set to the rollout horizon.
+Autoregressive evaluation initializes from the first test frame or history window and repeatedly applies the learned one-step map.
 
 ```bash
 python scripts/eval_npz.py --config configs/example_2d.json --data path/to/data.npz --ckpt runs/example_2d/best.pt --out runs/example_2d/eval.json --steps 200 --tau 0.1
 ```
 
-The JSON output includes per trajectory GMean100 and stable step together with summary statistics.
+The reported `gmean100` is computed from mean nRMSE over rollout steps 1 through 100. At each step, nRMSE is averaged across evaluated trajectories first, then the geometric mean is taken over time. By default the metric is unclipped. Set `--cap` to a positive value only when clipped diagnostics are desired.
+
+`stable_step` is the first rollout step where the mean nRMSE exceeds `tau`. Non-finite values are treated as threshold crossings.
 
 ## Build API
 
 ```python
-from sgno import build_sgno_from_config
+from sgno import build_sgno_from_config, summarize_gain_audit
 
 model = build_sgno_from_config(
-    network_config='sgno;width=20;modes=8;n_blocks=4;initial_step=1;dt=1.0;inner_steps=1;use_beta=false;filter_type=smooth;filter_strength=1.0;filter_order=8;padding=2;alpha_w=1.0;alpha_g=1.0',
+    network_config="sgno_canonical;width=5;modes=10;n_blocks=9;initial_step=1",
     num_spatial_dims=2,
     num_points=64,
     num_channels=1,
 )
+
+audit = summarize_gain_audit(model)
 ```
 
 ## License

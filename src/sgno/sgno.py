@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+_CANONICAL_DT = 1.0
+_MIXER_NORM_CAP = 1.0
+_HEAD_WIDTH = 128
 
 
 def _inv_softplus(x: float, eps: float = 1e-6) -> float:
@@ -21,220 +26,210 @@ def _phi1(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.where(small, series, safe)
 
 
-def _smooth_filter_nd(shape, strength: float, order: int, device, dtype=torch.float32):
-    if strength <= 0:
-        return torch.ones(*shape, device=device, dtype=dtype)
+def _radial_coord_nd(shape, device, dtype=torch.float32):
+    if not shape:
+        raise ValueError("shape must be non-empty")
     grids = []
     for m in shape:
         if m <= 1:
             grids.append(torch.zeros(m, device=device, dtype=dtype))
         else:
             grids.append(torch.linspace(0.0, 1.0, steps=m, device=device, dtype=dtype))
-    mesh = torch.meshgrid(*grids, indexing='ij')
+    mesh = torch.meshgrid(*grids, indexing="ij")
     r2 = torch.zeros_like(mesh[0])
     for g in mesh:
         r2 = r2 + g * g
-    r = torch.sqrt(r2 + 1e-12)
-    return torch.exp(-float(strength) * (r ** int(order)))
+    return torch.sqrt(r2 + 1e-12) / math.sqrt(float(len(shape)))
 
 
-def _two_thirds_mask_1d(m1: int, device, dtype=torch.float32):
-    if m1 <= 1:
-        return torch.ones(m1, device=device, dtype=dtype)
-    cutoff = max(1, int(math.floor((2.0 / 3.0) * (m1 - 1))))
-    k = torch.arange(m1, device=device)
-    return (k <= cutoff).to(dtype)
+def _nonnegative_radial_profile(radius: torch.Tensor, bias_raw: torch.Tensor, slope_raw: torch.Tensor):
+    slope = F.softplus(slope_raw)
+    return F.softplus(bias_raw - slope * radius)
 
 
-def _two_thirds_mask_2d(m1: int, m2: int, device, dtype=torch.float32):
-    return _two_thirds_mask_1d(m1, device, dtype)[:, None] * _two_thirds_mask_1d(m2, device, dtype)[None, :]
+def _unit_centered_radial_budget(radius: torch.Tensor, bias: torch.Tensor, slope_raw: torch.Tensor):
+    slope = F.softplus(slope_raw)
+    return 2.0 * torch.sigmoid(bias - slope * radius)
 
 
-def _two_thirds_mask_3d(m1: int, m2: int, m3: int, device, dtype=torch.float32):
-    return (
-        _two_thirds_mask_1d(m1, device, dtype)[:, None, None]
-        * _two_thirds_mask_1d(m2, device, dtype)[None, :, None]
-        * _two_thirds_mask_1d(m3, device, dtype)[None, None, :]
-    )
+def _project_mixer(mix: torch.Tensor, channels: int) -> torch.Tensor:
+    mats = mix.reshape(channels, channels, -1).permute(2, 0, 1)
+    norms = torch.linalg.matrix_norm(mats, ord=2)
+    scales = torch.clamp(_MIXER_NORM_CAP / torch.clamp(norms, min=1e-12), max=1.0)
+    mats = mats * scales[:, None, None]
+    return mats.permute(1, 2, 0).reshape_as(mix)
 
 
 class PointwiseMLP1d(nn.Module):
-    def __init__(self, width: int, hidden: int | None = None):
+    def __init__(self, width: int):
         super().__init__()
-        hidden = hidden or (2 * width)
+        conv1 = nn.Conv1d(width, 2 * width, 1)
+        conv2 = nn.Conv1d(2 * width, width, 1)
+        conv1 = nn.utils.parametrizations.spectral_norm(conv1)
+        conv2 = nn.utils.parametrizations.spectral_norm(conv2)
         self.net = nn.Sequential(
-            nn.Conv1d(width, hidden, 1),
+            conv1,
             nn.GELU(),
-            nn.Conv1d(hidden, width, 1),
+            conv2,
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
 class PointwiseMLP2d(nn.Module):
-    def __init__(self, width: int, hidden: int | None = None):
+    def __init__(self, width: int):
         super().__init__()
-        hidden = hidden or (2 * width)
+        conv1 = nn.Conv2d(width, 2 * width, 1)
+        conv2 = nn.Conv2d(2 * width, width, 1)
+        conv1 = nn.utils.parametrizations.spectral_norm(conv1)
+        conv2 = nn.utils.parametrizations.spectral_norm(conv2)
         self.net = nn.Sequential(
-            nn.Conv2d(width, hidden, 1),
+            conv1,
             nn.GELU(),
-            nn.Conv2d(hidden, width, 1),
+            conv2,
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
 class PointwiseMLP3d(nn.Module):
-    def __init__(self, width: int, hidden: int | None = None):
+    def __init__(self, width: int):
         super().__init__()
-        hidden = hidden or (2 * width)
+        conv1 = nn.Conv3d(width, 2 * width, 1)
+        conv2 = nn.Conv3d(2 * width, width, 1)
+        conv1 = nn.utils.parametrizations.spectral_norm(conv1)
+        conv2 = nn.utils.parametrizations.spectral_norm(conv2)
         self.net = nn.Sequential(
-            nn.Conv3d(width, hidden, 1),
+            conv1,
             nn.GELU(),
-            nn.Conv3d(hidden, width, 1),
+            conv2,
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
 class SpectralETD1d(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        modes1: int,
-        dt: float = 1.0,
-        use_beta: bool = False,
-        filter_type: str = 'smooth',
-        filter_strength: float = 2.0,
-        filter_order: int = 8,
-    ):
+    def __init__(self, channels: int, modes1: int):
         super().__init__()
-        self.channels = channels
-        self.modes1 = modes1
-        self.dt = float(dt)
-        self.use_beta = bool(use_beta)
-        self.filter_type = str(filter_type)
-        self.filter_strength = float(filter_strength)
-        self.filter_order = int(filter_order)
+        self.channels = int(channels)
+        self.modes1 = int(modes1)
+        self.dt = _CANONICAL_DT
 
         self.log_decay = nn.Parameter(torch.randn(channels, modes1) * 0.1)
-        if self.use_beta:
-            self.beta = nn.Parameter(torch.randn(channels, modes1) * 0.1)
-        else:
-            self.register_parameter('beta', None)
-
         scale = 1.0 / (channels * channels)
         self.mix = nn.Parameter(scale * torch.rand(channels, channels, modes1, dtype=torch.cfloat))
 
+        tiny = _inv_softplus(1e-3)
+        self.damp_bias_raw = nn.Parameter(torch.full((channels, 1), tiny, dtype=torch.float32))
+        self.damp_slope_raw = nn.Parameter(torch.full((channels, 1), tiny, dtype=torch.float32))
+        self.inj_bias = nn.Parameter(torch.zeros(channels, 1, dtype=torch.float32))
+        self.inj_slope_raw = nn.Parameter(torch.full((channels, 1), tiny, dtype=torch.float32))
+
+    def _damping_profile(self, device):
+        radius = _radial_coord_nd((self.modes1,), device=device).view(1, self.modes1)
+        return _nonnegative_radial_profile(
+            radius,
+            self.damp_bias_raw.to(device=device),
+            self.damp_slope_raw.to(device=device),
+        )
+
+    def _injection_budget(self, device):
+        radius = _radial_coord_nd((self.modes1,), device=device).view(1, self.modes1)
+        return _unit_centered_radial_budget(
+            radius,
+            self.inj_bias.to(device=device),
+            self.inj_slope_raw.to(device=device),
+        )
+
     def _lambda(self, device):
-        alpha = -F.softplus(self.log_decay)
-        if self.use_beta and self.beta is not None:
-            beta = self.beta
-        else:
-            beta = torch.zeros_like(alpha)
+        log_decay = self.log_decay.to(device=device)
+        alpha = -(F.softplus(log_decay) + self._damping_profile(device))
+        beta = torch.zeros_like(alpha)
         return torch.complex(alpha, beta).to(device=device)
 
-    def _filter(self, device):
-        if self.filter_type == 'none':
-            return None
-        if self.filter_type in ('2/3', 'two_thirds', 'two-thirds'):
-            return _two_thirds_mask_1d(self.modes1, device=device)
-        return _smooth_filter_nd((self.modes1,), self.filter_strength, self.filter_order, device=device)
+    def _mix_projected(self, device):
+        return _project_mixer(self.mix.to(device=device), self.channels)
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        B, C, X = v.shape
-        assert C == self.channels
+        _, c, x_size = v.shape
+        if c != self.channels:
+            raise ValueError(f"expected {self.channels} channels, got {c}")
 
         v_hat = torch.fft.rfft(v.float())
         g_hat = torch.fft.rfft(g.float())
         out_hat = torch.zeros_like(v_hat)
 
         m1 = min(self.modes1, v_hat.size(-1))
-
         lam = self._lambda(v.device)[:, :m1]
-        z = (self.dt * lam).unsqueeze(0)
-        expz = torch.exp(z)
-        phi = _phi1(z)
+        z = (_CANONICAL_DT * lam).unsqueeze(0)
 
         vh = v_hat[:, :, :m1]
         gh = g_hat[:, :, :m1]
+        mix = self._mix_projected(v.device)[:, :, :m1]
+        gmix = torch.einsum("bim,iom->bom", gh, mix)
 
-        mix = self.mix[:, :, :m1].to(device=v.device)
-        gmix = torch.einsum('bim,iom->bom', gh, mix)
-
-        lin = expz * vh
-        forcing = (self.dt * phi) * gmix
-
-        filt = self._filter(v.device)
-        if filt is not None:
-            forcing = forcing * filt[:m1].view(1, 1, m1)
-
-        out_hat[:, :, :m1] = lin + forcing
-        return torch.fft.irfft(out_hat, n=X)
+        lin = torch.exp(z) * vh
+        forcing = (_CANONICAL_DT * _phi1(z)) * gmix
+        budget = self._injection_budget(v.device)[:, :m1].view(1, self.channels, m1)
+        out_hat[:, :, :m1] = lin + forcing * budget
+        return torch.fft.irfft(out_hat, n=x_size)
 
 
 class SpectralETD2d(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        modes1: int,
-        modes2: int,
-        dt: float = 1.0,
-        use_beta: bool = False,
-        filter_type: str = 'smooth',
-        filter_strength: float = 2.0,
-        filter_order: int = 8,
-    ):
+    def __init__(self, channels: int, modes1: int, modes2: int):
         super().__init__()
-        self.channels = channels
-        self.modes1 = modes1
-        self.modes2 = modes2
-        self.dt = float(dt)
-        self.use_beta = bool(use_beta)
-        self.filter_type = str(filter_type)
-        self.filter_strength = float(filter_strength)
-        self.filter_order = int(filter_order)
+        self.channels = int(channels)
+        self.modes1 = int(modes1)
+        self.modes2 = int(modes2)
+        self.dt = _CANONICAL_DT
 
         self.log_decay_pos = nn.Parameter(torch.randn(channels, modes1, modes2) * 0.1)
         self.log_decay_neg = nn.Parameter(torch.randn(channels, modes1, modes2) * 0.1)
-
-        if self.use_beta:
-            self.beta_pos = nn.Parameter(torch.randn(channels, modes1, modes2) * 0.1)
-            self.beta_neg = nn.Parameter(torch.randn(channels, modes1, modes2) * 0.1)
-        else:
-            self.register_parameter('beta_pos', None)
-            self.register_parameter('beta_neg', None)
 
         scale = 1.0 / math.sqrt(channels)
         self.mix_pos = nn.Parameter(scale * torch.randn(channels, channels, modes1, modes2, dtype=torch.cfloat))
         self.mix_neg = nn.Parameter(scale * torch.randn(channels, channels, modes1, modes2, dtype=torch.cfloat))
 
+        tiny = _inv_softplus(1e-3)
+        self.damp_bias_raw = nn.Parameter(torch.full((channels, 1, 1), tiny, dtype=torch.float32))
+        self.damp_slope_raw = nn.Parameter(torch.full((channels, 1, 1), tiny, dtype=torch.float32))
+        self.inj_bias = nn.Parameter(torch.zeros(channels, 1, 1, dtype=torch.float32))
+        self.inj_slope_raw = nn.Parameter(torch.full((channels, 1, 1), tiny, dtype=torch.float32))
+
+    def _damping_profile(self, device):
+        radius = _radial_coord_nd((self.modes1, self.modes2), device=device).view(1, self.modes1, self.modes2)
+        return _nonnegative_radial_profile(
+            radius,
+            self.damp_bias_raw.to(device=device),
+            self.damp_slope_raw.to(device=device),
+        )
+
+    def _injection_budget(self, device):
+        radius = _radial_coord_nd((self.modes1, self.modes2), device=device).view(1, self.modes1, self.modes2)
+        return _unit_centered_radial_budget(
+            radius,
+            self.inj_bias.to(device=device),
+            self.inj_slope_raw.to(device=device),
+        )
+
     def _lambda(self, device):
-        a_pos = -F.softplus(self.log_decay_pos)
-        a_neg = -F.softplus(self.log_decay_neg)
-        if self.use_beta and self.beta_pos is not None and self.beta_neg is not None:
-            b_pos = self.beta_pos
-            b_neg = self.beta_neg
-        else:
-            b_pos = torch.zeros_like(a_pos)
-            b_neg = torch.zeros_like(a_neg)
-        lam_pos = torch.complex(a_pos, b_pos).to(device=device)
-        lam_neg = torch.complex(a_neg, b_neg).to(device=device)
+        damp = self._damping_profile(device)
+        a_pos = -(F.softplus(self.log_decay_pos.to(device=device)) + damp)
+        a_neg = -(F.softplus(self.log_decay_neg.to(device=device)) + damp)
+        lam_pos = torch.complex(a_pos, torch.zeros_like(a_pos)).to(device=device)
+        lam_neg = torch.complex(a_neg, torch.zeros_like(a_neg)).to(device=device)
         return lam_pos, lam_neg
 
-    def _filter(self, device):
-        if self.filter_type == 'none':
-            return None
-        if self.filter_type in ('2/3', 'two_thirds', 'two-thirds'):
-            return _two_thirds_mask_2d(self.modes1, self.modes2, device=device)
-        return _smooth_filter_nd((self.modes1, self.modes2), self.filter_strength, self.filter_order, device=device)
+    def _project_mix(self, mix: torch.Tensor):
+        return _project_mixer(mix, self.channels)
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        B, C, X, Y = v.shape
-        assert C == self.channels
+        _, c, x_size, y_size = v.shape
+        if c != self.channels:
+            raise ValueError(f"expected {self.channels} channels, got {c}")
 
         v_hat = torch.fft.rfft2(v.float())
         g_hat = torch.fft.rfft2(g.float())
@@ -246,80 +241,40 @@ class SpectralETD2d(nn.Module):
         lam_pos, lam_neg = self._lambda(v.device)
         lam_pos = lam_pos[:, :m1, :m2]
         lam_neg = lam_neg[:, :m1, :m2]
+        z_pos = (_CANONICAL_DT * lam_pos).unsqueeze(0)
+        z_neg = (_CANONICAL_DT * lam_neg).unsqueeze(0)
 
-        z_pos = (self.dt * lam_pos).unsqueeze(0)
-        z_neg = (self.dt * lam_neg).unsqueeze(0)
-        exp_pos = torch.exp(z_pos)
-        exp_neg = torch.exp(z_neg)
-        phi_pos = _phi1(z_pos)
-        phi_neg = _phi1(z_neg)
-
-        filt = self._filter(v.device)
-        if filt is not None:
-            filt = filt[:m1, :m2].view(1, 1, m1, m2)
+        budget = self._injection_budget(v.device)[:, :m1, :m2].view(1, self.channels, m1, m2)
 
         vp = v_hat[:, :, :m1, :m2]
         gp = g_hat[:, :, :m1, :m2]
-        mixp = self.mix_pos[:, :, :m1, :m2].to(device=v.device)
-        gmp = torch.einsum('bixy,ioxy->boxy', gp, mixp)
-        lin_p = exp_pos * vp
-        forcing_p = (self.dt * phi_pos) * gmp
-        if filt is not None:
-            forcing_p = forcing_p * filt
-        out_hat[:, :, :m1, :m2] = lin_p + forcing_p
+        mixp = self._project_mix(self.mix_pos.to(device=v.device))[:, :, :m1, :m2]
+        gmp = torch.einsum("bixy,ioxy->boxy", gp, mixp)
+        out_hat[:, :, :m1, :m2] = torch.exp(z_pos) * vp + (_CANONICAL_DT * _phi1(z_pos)) * gmp * budget
 
         vn = v_hat[:, :, -m1:, :m2]
         gn = g_hat[:, :, -m1:, :m2]
-        mixn = self.mix_neg[:, :, :m1, :m2].to(device=v.device)
-        gmn = torch.einsum('bixy,ioxy->boxy', gn, mixn)
-        lin_n = exp_neg * vn
-        forcing_n = (self.dt * phi_neg) * gmn
-        if filt is not None:
-            forcing_n = forcing_n * filt
-        out_hat[:, :, -m1:, :m2] = lin_n + forcing_n
+        mixn = self._project_mix(self.mix_neg.to(device=v.device))[:, :, :m1, :m2]
+        gmn = torch.einsum("bixy,ioxy->boxy", gn, mixn)
+        out_hat[:, :, -m1:, :m2] = torch.exp(z_neg) * vn + (_CANONICAL_DT * _phi1(z_neg)) * gmn * budget
 
-        return torch.fft.irfft2(out_hat, s=(X, Y))
+        return torch.fft.irfft2(out_hat, s=(x_size, y_size))
 
 
 class SpectralETD3d(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        modes1: int,
-        modes2: int,
-        modes3: int,
-        dt: float = 1.0,
-        use_beta: bool = False,
-        filter_type: str = 'smooth',
-        filter_strength: float = 2.0,
-        filter_order: int = 8,
-    ):
+    def __init__(self, channels: int, modes1: int, modes2: int, modes3: int):
         super().__init__()
-        self.channels = channels
-        self.modes1 = modes1
-        self.modes2 = modes2
-        self.modes3 = modes3
-        self.dt = float(dt)
-        self.use_beta = bool(use_beta)
-        self.filter_type = str(filter_type)
-        self.filter_strength = float(filter_strength)
-        self.filter_order = int(filter_order)
+        self.channels = int(channels)
+        self.modes1 = int(modes1)
+        self.modes2 = int(modes2)
+        self.modes3 = int(modes3)
+        self.dt = _CANONICAL_DT
 
-        self.log_decay1 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-        self.log_decay2 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-        self.log_decay3 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-        self.log_decay4 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-
-        if self.use_beta:
-            self.beta1 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-            self.beta2 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-            self.beta3 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-            self.beta4 = nn.Parameter(torch.randn(channels, modes1, modes2, modes3) * 0.1)
-        else:
-            self.register_parameter('beta1', None)
-            self.register_parameter('beta2', None)
-            self.register_parameter('beta3', None)
-            self.register_parameter('beta4', None)
+        shape = (channels, modes1, modes2, modes3)
+        self.log_decay1 = nn.Parameter(torch.randn(*shape) * 0.1)
+        self.log_decay2 = nn.Parameter(torch.randn(*shape) * 0.1)
+        self.log_decay3 = nn.Parameter(torch.randn(*shape) * 0.1)
+        self.log_decay4 = nn.Parameter(torch.randn(*shape) * 0.1)
 
         scale = 1.0 / (channels * channels)
         self.mix1 = nn.Parameter(scale * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat))
@@ -327,29 +282,50 @@ class SpectralETD3d(nn.Module):
         self.mix3 = nn.Parameter(scale * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat))
         self.mix4 = nn.Parameter(scale * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat))
 
-    def _lam_block(self, log_decay, beta, device):
-        alpha = -F.softplus(log_decay)
-        if self.use_beta and beta is not None:
-            b = beta
-        else:
-            b = torch.zeros_like(alpha)
-        return torch.complex(alpha, b).to(device=device)
+        tiny = _inv_softplus(1e-3)
+        self.damp_bias_raw = nn.Parameter(torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32))
+        self.damp_slope_raw = nn.Parameter(torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32))
+        self.inj_bias = nn.Parameter(torch.zeros(channels, 1, 1, 1, dtype=torch.float32))
+        self.inj_slope_raw = nn.Parameter(torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32))
 
-    def _filter(self, device):
-        if self.filter_type == 'none':
-            return None
-        if self.filter_type in ('2/3', 'two_thirds', 'two-thirds'):
-            return _two_thirds_mask_3d(self.modes1, self.modes2, self.modes3, device=device)
-        return _smooth_filter_nd(
-            (self.modes1, self.modes2, self.modes3),
-            self.filter_strength,
-            self.filter_order,
-            device=device,
+    def _damping_profile(self, device):
+        radius = _radial_coord_nd((self.modes1, self.modes2, self.modes3), device=device).view(
+            1,
+            self.modes1,
+            self.modes2,
+            self.modes3,
+        )
+        return _nonnegative_radial_profile(
+            radius,
+            self.damp_bias_raw.to(device=device),
+            self.damp_slope_raw.to(device=device),
         )
 
+    def _injection_budget(self, device):
+        radius = _radial_coord_nd((self.modes1, self.modes2, self.modes3), device=device).view(
+            1,
+            self.modes1,
+            self.modes2,
+            self.modes3,
+        )
+        return _unit_centered_radial_budget(
+            radius,
+            self.inj_bias.to(device=device),
+            self.inj_slope_raw.to(device=device),
+        )
+
+    def _lam_block(self, log_decay: torch.Tensor, device):
+        damp = self._damping_profile(device)
+        alpha = -(F.softplus(log_decay.to(device=device)) + damp)
+        return torch.complex(alpha, torch.zeros_like(alpha)).to(device=device)
+
+    def _project_mix(self, mix: torch.Tensor):
+        return _project_mixer(mix, self.channels)
+
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        B, C, X, Y, Z = v.shape
-        assert C == self.channels
+        _, c, x_size, y_size, z_size = v.shape
+        if c != self.channels:
+            raise ValueError(f"expected {self.channels} channels, got {c}")
 
         v_hat = torch.fft.rfftn(v.float(), dim=[-3, -2, -1])
         g_hat = torch.fft.rfftn(g.float(), dim=[-3, -2, -1])
@@ -358,129 +334,72 @@ class SpectralETD3d(nn.Module):
         m1 = min(self.modes1, v_hat.size(-3))
         m2 = min(self.modes2, v_hat.size(-2))
         m3 = min(self.modes3, v_hat.size(-1))
-
-        filt = self._filter(v.device)
-        if filt is not None:
-            filt = filt[:m1, :m2, :m3].view(1, 1, m1, m2, m3)
-
-        b1 = None if self.beta1 is None else self.beta1[:, :m1, :m2, :m3]
-        b2 = None if self.beta2 is None else self.beta2[:, :m1, :m2, :m3]
-        b3 = None if self.beta3 is None else self.beta3[:, :m1, :m2, :m3]
-        b4 = None if self.beta4 is None else self.beta4[:, :m1, :m2, :m3]
-
-        lam1 = self._lam_block(self.log_decay1[:, :m1, :m2, :m3], b1, v.device)
-        lam2 = self._lam_block(self.log_decay2[:, :m1, :m2, :m3], b2, v.device)
-        lam3 = self._lam_block(self.log_decay3[:, :m1, :m2, :m3], b3, v.device)
-        lam4 = self._lam_block(self.log_decay4[:, :m1, :m2, :m3], b4, v.device)
+        budget = self._injection_budget(v.device)[:, :m1, :m2, :m3].view(1, self.channels, m1, m2, m3)
 
         def apply_block(vs, gs, lam, mix):
-            zc = (self.dt * lam).unsqueeze(0)
-            lin = torch.exp(zc) * vs
-            mix = mix[:, :, :m1, :m2, :m3].to(device=v.device)
-            gmix = torch.einsum('bixyz,ioxyz->boxyz', gs, mix)
-            forcing = (self.dt * _phi1(zc)) * gmix
-            if filt is not None:
-                forcing = forcing * filt
-            return lin + forcing
+            zc = (_CANONICAL_DT * lam).unsqueeze(0)
+            mix = self._project_mix(mix.to(device=v.device))[:, :, :m1, :m2, :m3]
+            gmix = torch.einsum("bixyz,ioxyz->boxyz", gs, mix)
+            return torch.exp(zc) * vs + (_CANONICAL_DT * _phi1(zc)) * gmix * budget
 
-        v1 = v_hat[:, :, :m1, :m2, :m3]
-        g1 = g_hat[:, :, :m1, :m2, :m3]
-        out_hat[:, :, :m1, :m2, :m3] = apply_block(v1, g1, lam1, self.mix1)
+        lam1 = self._lam_block(self.log_decay1[:, :m1, :m2, :m3], v.device)
+        lam2 = self._lam_block(self.log_decay2[:, :m1, :m2, :m3], v.device)
+        lam3 = self._lam_block(self.log_decay3[:, :m1, :m2, :m3], v.device)
+        lam4 = self._lam_block(self.log_decay4[:, :m1, :m2, :m3], v.device)
 
-        v2 = v_hat[:, :, -m1:, :m2, :m3]
-        g2 = g_hat[:, :, -m1:, :m2, :m3]
-        out_hat[:, :, -m1:, :m2, :m3] = apply_block(v2, g2, lam2, self.mix2)
+        out_hat[:, :, :m1, :m2, :m3] = apply_block(
+            v_hat[:, :, :m1, :m2, :m3],
+            g_hat[:, :, :m1, :m2, :m3],
+            lam1,
+            self.mix1,
+        )
+        out_hat[:, :, -m1:, :m2, :m3] = apply_block(
+            v_hat[:, :, -m1:, :m2, :m3],
+            g_hat[:, :, -m1:, :m2, :m3],
+            lam2,
+            self.mix2,
+        )
+        out_hat[:, :, :m1, -m2:, :m3] = apply_block(
+            v_hat[:, :, :m1, -m2:, :m3],
+            g_hat[:, :, :m1, -m2:, :m3],
+            lam3,
+            self.mix3,
+        )
+        out_hat[:, :, -m1:, -m2:, :m3] = apply_block(
+            v_hat[:, :, -m1:, -m2:, :m3],
+            g_hat[:, :, -m1:, -m2:, :m3],
+            lam4,
+            self.mix4,
+        )
 
-        v3 = v_hat[:, :, :m1, -m2:, :m3]
-        g3 = g_hat[:, :, :m1, -m2:, :m3]
-        out_hat[:, :, :m1, -m2:, :m3] = apply_block(v3, g3, lam3, self.mix3)
-
-        v4 = v_hat[:, :, -m1:, -m2:, :m3]
-        g4 = g_hat[:, :, -m1:, -m2:, :m3]
-        out_hat[:, :, -m1:, -m2:, :m3] = apply_block(v4, g4, lam4, self.mix4)
-
-        return torch.fft.irfftn(out_hat, s=(X, Y, Z))
+        return torch.fft.irfftn(out_hat, s=(x_size, y_size, z_size))
 
 
 class SGNO1d(nn.Module):
-    def __init__(
-        self,
-        num_channels: int,
-        modes: int = 16,
-        width: int = 64,
-        initial_step: int = 10,
-        dt: float = 1.0,
-        use_beta: bool = False,
-        filter_type: str = 'smooth',
-        filter_strength: float = 2.0,
-        filter_order: int = 8,
-        padding: int = 2,
-        n_blocks: int = 4,
-        alpha_w: float = 0.6,
-        alpha_g: float = 1.0,
-        inner_steps: int = 1,
-    ):
+    def __init__(self, num_channels: int, modes: int = 16, width: int = 64, initial_step: int = 1, n_blocks: int = 4):
         super().__init__()
-        self.modes1 = modes
-        self.width = width
-        self.padding = int(padding)
+        self.modes1 = int(modes)
+        self.width = int(width)
         self.n_blocks = int(n_blocks)
+        self.initial_step = int(initial_step)
+        self.padding = 0
 
-        self.alpha_w_raw = nn.Parameter(torch.tensor(_inv_softplus(alpha_w), dtype=torch.float32))
-        self.alpha_g_raw = nn.Parameter(torch.tensor(_inv_softplus(alpha_g), dtype=torch.float32))
-
-        self.fc0 = nn.Linear(initial_step * num_channels + 1, self.width)
-
+        self.fc0 = nn.Linear(self.initial_step * num_channels + 1, self.width)
         self.gs = nn.ModuleList([PointwiseMLP1d(self.width) for _ in range(self.n_blocks)])
-        self.etds = nn.ModuleList(
-            [
-                SpectralETD1d(self.width, self.modes1, dt, use_beta, filter_type, filter_strength, filter_order)
-                for _ in range(self.n_blocks)
-            ]
-        )
-        self.ws = nn.ModuleList([nn.Conv1d(self.width, self.width, 1) for _ in range(self.n_blocks)])
-
-        self.inner_steps = int(inner_steps)
-        self._base_dts = [float(m.dt) for m in self.etds]
-
-        self.fc1 = nn.Linear(self.width, 128)
-        self.fc2 = nn.Linear(128, num_channels)
+        self.etds = nn.ModuleList([SpectralETD1d(self.width, self.modes1) for _ in range(self.n_blocks)])
+        self.bs = nn.ModuleList([nn.Conv1d(self.width, self.width, 1) for _ in range(self.n_blocks)])
+        self.fc1 = nn.Linear(self.width, _HEAD_WIDTH)
+        self.fc2 = nn.Linear(_HEAD_WIDTH, num_channels)
 
     def forward(self, x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         x = torch.cat((x, grid), dim=-1)
-        x = self.fc0(x)
-        x = x.permute(0, 2, 1)
-
-        if self.padding > 0:
-            x = F.pad(x, [0, self.padding])
-
-        alpha_w = F.softplus(self.alpha_w_raw)
-        alpha_g = F.softplus(self.alpha_g_raw)
-
+        x = self.fc0(x).permute(0, 2, 1)
         for i in range(self.n_blocks):
-            etd = self.etds[i]
-            dt0 = self._base_dts[i]
-            k = max(1, int(self.inner_steps))
-            dt_step = dt0 / float(k)
-            w_scale = 1.0 / float(k)
-
-            for s in range(k):
-                etd.dt = dt_step
-                g = alpha_g * self.gs[i](x)
-                upd = etd(x, g) + (alpha_w * w_scale) * self.ws[i](x)
-
-                last = (i == self.n_blocks - 1) and (s == k - 1)
-                x = upd if last else F.gelu(upd)
-
-            etd.dt = dt0
-
-        if self.padding > 0:
-            x = x[..., :-self.padding]
-
+            upd = self.etds[i](x, self.gs[i](x)) + self.bs[i](x)
+            x = upd if i == self.n_blocks - 1 else F.gelu(upd)
         x = x.permute(0, 2, 1)
         x = F.gelu(self.fc1(x))
-        x = self.fc2(x)
-        return x.unsqueeze(-2)
+        return self.fc2(x).unsqueeze(-2)
 
 
 class SGNO2d(nn.Module):
@@ -490,89 +409,33 @@ class SGNO2d(nn.Module):
         modes1: int = 12,
         modes2: int = 12,
         width: int = 20,
-        initial_step: int = 10,
-        dt: float = 1.0,
-        use_beta: bool = False,
-        filter_type: str = 'smooth',
-        filter_strength: float = 2.0,
-        filter_order: int = 8,
-        padding: int = 2,
+        initial_step: int = 1,
         n_blocks: int = 4,
-        alpha_w: float = 1.0,
-        alpha_g: float = 10.0,
-        inner_steps: int = 1,
     ):
         super().__init__()
-        self.modes1 = modes1
-        self.modes2 = modes2
-        self.width = width
-        self.padding = int(padding)
+        self.modes1 = int(modes1)
+        self.modes2 = int(modes2)
+        self.width = int(width)
         self.n_blocks = int(n_blocks)
+        self.initial_step = int(initial_step)
+        self.padding = 0
 
-        self.alpha_w_raw = nn.Parameter(torch.tensor(_inv_softplus(alpha_w), dtype=torch.float32))
-        self.alpha_g_raw = nn.Parameter(torch.tensor(_inv_softplus(alpha_g), dtype=torch.float32))
-
-        self.fc0 = nn.Linear(initial_step * num_channels + 2, self.width)
-
+        self.fc0 = nn.Linear(self.initial_step * num_channels + 2, self.width)
         self.gs = nn.ModuleList([PointwiseMLP2d(self.width) for _ in range(self.n_blocks)])
-        self.etds = nn.ModuleList(
-            [
-                SpectralETD2d(
-                    self.width,
-                    self.modes1,
-                    self.modes2,
-                    dt,
-                    use_beta,
-                    filter_type,
-                    filter_strength,
-                    filter_order,
-                )
-                for _ in range(self.n_blocks)
-            ]
-        )
-        self.ws = nn.ModuleList([nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_blocks)])
-
-        self.inner_steps = int(inner_steps)
-        self._base_dts = [float(m.dt) for m in self.etds]
-
-        self.fc1 = nn.Linear(self.width, 128)
-        self.fc2 = nn.Linear(128, num_channels)
+        self.etds = nn.ModuleList([SpectralETD2d(self.width, self.modes1, self.modes2) for _ in range(self.n_blocks)])
+        self.bs = nn.ModuleList([nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_blocks)])
+        self.fc1 = nn.Linear(self.width, _HEAD_WIDTH)
+        self.fc2 = nn.Linear(_HEAD_WIDTH, num_channels)
 
     def forward(self, x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         x = torch.cat((x, grid), dim=-1)
-        x = self.fc0(x)
-        x = x.permute(0, 3, 1, 2)
-
-        if self.padding > 0:
-            x = F.pad(x, [0, self.padding, 0, self.padding])
-
-        alpha_w = F.softplus(self.alpha_w_raw)
-        alpha_g = F.softplus(self.alpha_g_raw)
-
+        x = self.fc0(x).permute(0, 3, 1, 2)
         for i in range(self.n_blocks):
-            etd = self.etds[i]
-            dt0 = self._base_dts[i]
-            k = max(1, int(self.inner_steps))
-            dt_step = dt0 / float(k)
-            w_scale = 1.0 / float(k)
-
-            for s in range(k):
-                etd.dt = dt_step
-                g = alpha_g * self.gs[i](x)
-                upd = etd(x, g) + (alpha_w * w_scale) * self.ws[i](x)
-
-                last = (i == self.n_blocks - 1) and (s == k - 1)
-                x = upd if last else F.gelu(upd)
-
-            etd.dt = dt0
-
-        if self.padding > 0:
-            x = x[..., :-self.padding, :-self.padding]
-
+            upd = self.etds[i](x, self.gs[i](x)) + self.bs[i](x)
+            x = upd if i == self.n_blocks - 1 else F.gelu(upd)
         x = x.permute(0, 2, 3, 1)
         x = F.gelu(self.fc1(x))
-        x = self.fc2(x)
-        return x.unsqueeze(-2)
+        return self.fc2(x).unsqueeze(-2)
 
 
 class SGNO3d(nn.Module):
@@ -583,165 +446,58 @@ class SGNO3d(nn.Module):
         modes2: int = 8,
         modes3: int = 8,
         width: int = 20,
-        initial_step: int = 10,
-        dt: float = 1.0,
-        use_beta: bool = False,
-        filter_type: str = 'smooth',
-        filter_strength: float = 2.0,
-        filter_order: int = 8,
-        padding: int = 6,
+        initial_step: int = 1,
         n_blocks: int = 4,
-        alpha_w: float = 1.0,
-        alpha_g: float = 10.0,
-        inner_steps: int = 1,
     ):
         super().__init__()
-        self.modes1 = modes1
-        self.modes2 = modes2
-        self.modes3 = modes3
-        self.width = width
-        self.padding = int(padding)
+        self.modes1 = int(modes1)
+        self.modes2 = int(modes2)
+        self.modes3 = int(modes3)
+        self.width = int(width)
         self.n_blocks = int(n_blocks)
+        self.initial_step = int(initial_step)
+        self.padding = 0
 
-        self.fc0 = nn.Linear(initial_step * num_channels + 3, self.width)
-
+        self.fc0 = nn.Linear(self.initial_step * num_channels + 3, self.width)
         self.gs = nn.ModuleList([PointwiseMLP3d(self.width) for _ in range(self.n_blocks)])
         self.etds = nn.ModuleList(
-            [
-                SpectralETD3d(
-                    self.width,
-                    self.modes1,
-                    self.modes2,
-                    self.modes3,
-                    dt,
-                    use_beta,
-                    filter_type,
-                    filter_strength,
-                    filter_order,
-                )
-                for _ in range(self.n_blocks)
-            ]
+            [SpectralETD3d(self.width, self.modes1, self.modes2, self.modes3) for _ in range(self.n_blocks)]
         )
-        self.ws = nn.ModuleList([nn.Conv3d(self.width, self.width, 1) for _ in range(self.n_blocks)])
-
-        self.inner_steps = int(inner_steps)
-        self._base_dts = [float(m.dt) for m in self.etds]
-
-        self.fc1 = nn.Linear(self.width, 128)
-        self.fc2 = nn.Linear(128, num_channels)
-        self.alpha_w_raw = nn.Parameter(torch.tensor(_inv_softplus(alpha_w), dtype=torch.float32))
-        self.alpha_g_raw = nn.Parameter(torch.tensor(_inv_softplus(alpha_g), dtype=torch.float32))
+        self.bs = nn.ModuleList([nn.Conv3d(self.width, self.width, 1) for _ in range(self.n_blocks)])
+        self.fc1 = nn.Linear(self.width, _HEAD_WIDTH)
+        self.fc2 = nn.Linear(_HEAD_WIDTH, num_channels)
 
     def forward(self, x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
         x = torch.cat((x, grid), dim=-1)
-        x = self.fc0(x)
-        x = x.permute(0, 4, 1, 2, 3)
-
-        if self.padding > 0:
-            x = F.pad(x, [0, self.padding, 0, self.padding, 0, self.padding])
-
-        alpha_w = F.softplus(self.alpha_w_raw)
-        alpha_g = F.softplus(self.alpha_g_raw)
-
+        x = self.fc0(x).permute(0, 4, 1, 2, 3)
         for i in range(self.n_blocks):
-            etd = self.etds[i]
-            dt0 = self._base_dts[i]
-            k = max(1, int(self.inner_steps))
-            dt_step = dt0 / float(k)
-            w_scale = 1.0 / float(k)
-
-            for s in range(k):
-                etd.dt = dt_step
-                g = alpha_g * self.gs[i](x)
-                upd = etd(x, g) + (alpha_w * w_scale) * self.ws[i](x)
-
-                last = (i == self.n_blocks - 1) and (s == k - 1)
-                x = upd if last else F.gelu(upd)
-
-            etd.dt = dt0
-
-        if self.padding > 0:
-            x = x[..., :-self.padding, :-self.padding, :-self.padding]
-
+            upd = self.etds[i](x, self.gs[i](x)) + self.bs[i](x)
+            x = upd if i == self.n_blocks - 1 else F.gelu(upd)
         x = x.permute(0, 2, 3, 4, 1)
         x = F.gelu(self.fc1(x))
-        x = self.fc2(x)
-        return x.unsqueeze(-2)
+        return self.fc2(x).unsqueeze(-2)
 
 
-def _parse_network_config(network_config: str) -> Dict[str, Any]:
-    s = (network_config or '').strip()
-    if not s:
-        return {}
-    parts = [p.strip() for p in s.split(';') if p.strip()]
-    if not parts:
-        return {}
-
-    cfg: Dict[str, Any] = {}
-
-    has_kv = any(('=' in p) for p in parts[1:])
-    if has_kv:
-        for p in parts[1:]:
-            if '=' not in p:
-                continue
-            k, v = p.split('=', 1)
-            k = k.strip().lower()
-            v = v.strip()
-            if re.fullmatch(r'-?\d+', v):
-                cfg[k] = int(v)
-            elif re.fullmatch(r'-?\d+(\.\d+)?([eE]-?\d+)?', v):
-                cfg[k] = float(v)
-            elif v.lower() in ('true', 'false'):
-                cfg[k] = (v.lower() == 'true')
-            else:
-                cfg[k] = v
-        return cfg
-
-    nums = []
-    tail = []
-    for p in parts[1:]:
-        if re.fullmatch(r'-?\d+', p):
-            nums.append(int(p))
-        elif re.fullmatch(r'-?\d+(\.\d+)?([eE]-?\d+)?', p):
-            nums.append(float(p))
-        else:
-            tail.append(p.lower())
-
-    if len(nums) >= 3:
-        cfg['width'] = int(nums[0])
-        cfg['modes'] = int(nums[1])
-        cfg['n_blocks'] = int(nums[2])
-    if len(nums) >= 4 and isinstance(nums[3], (int, float)):
-        cfg['initial_step'] = int(nums[3])
-    if len(nums) >= 5 and isinstance(nums[4], (int, float)):
-        cfg['dt'] = float(nums[4])
-
-    if tail:
-        cfg['activation'] = tail[-1]
-
-    return cfg
+def _make_grid_1d(batch: int, x_size: int, device, dtype):
+    x = torch.linspace(0.0, 1.0, steps=x_size, device=device, dtype=dtype).view(1, x_size, 1)
+    return x.expand(batch, x_size, 1)
 
 
-def _make_grid_1d(B: int, X: int, device, dtype):
-    x = torch.linspace(0.0, 1.0, steps=X, device=device, dtype=dtype).view(1, X, 1)
-    return x.expand(B, X, 1)
+def _make_grid_2d(batch: int, x_size: int, y_size: int, device, dtype):
+    gx = torch.linspace(0.0, 1.0, steps=x_size, device=device, dtype=dtype)
+    gy = torch.linspace(0.0, 1.0, steps=y_size, device=device, dtype=dtype)
+    xx, yy = torch.meshgrid(gx, gy, indexing="ij")
+    grid = torch.stack([xx, yy], dim=-1).view(1, x_size, y_size, 2)
+    return grid.expand(batch, x_size, y_size, 2)
 
 
-def _make_grid_2d(B: int, X: int, Y: int, device, dtype):
-    gx = torch.linspace(0.0, 1.0, steps=X, device=device, dtype=dtype)
-    gy = torch.linspace(0.0, 1.0, steps=Y, device=device, dtype=dtype)
-    xx, yy = torch.meshgrid(gx, gy, indexing='ij')
-    g = torch.stack([xx, yy], dim=-1).view(1, X, Y, 2)
-    return g.expand(B, X, Y, 2)
-
-
-def _make_grid_3d(B: int, X: int, Y: int, Z: int, device, dtype):
-    gx = torch.linspace(0.0, 1.0, steps=X, device=device, dtype=dtype)
-    gy = torch.linspace(0.0, 1.0, steps=Y, device=device, dtype=dtype)
-    gz = torch.linspace(0.0, 1.0, steps=Z, device=device, dtype=dtype)
-    xx, yy, zz = torch.meshgrid(gx, gy, gz, indexing='ij')
-    g = torch.stack([xx, yy, zz], dim=-1).view(1, X, Y, Z, 3)
-    return g.expand(B, X, Y, Z, 3)
+def _make_grid_3d(batch: int, x_size: int, y_size: int, z_size: int, device, dtype):
+    gx = torch.linspace(0.0, 1.0, steps=x_size, device=device, dtype=dtype)
+    gy = torch.linspace(0.0, 1.0, steps=y_size, device=device, dtype=dtype)
+    gz = torch.linspace(0.0, 1.0, steps=z_size, device=device, dtype=dtype)
+    xx, yy, zz = torch.meshgrid(gx, gy, gz, indexing="ij")
+    grid = torch.stack([xx, yy, zz], dim=-1).view(1, x_size, y_size, z_size, 3)
+    return grid.expand(batch, x_size, y_size, z_size, 3)
 
 
 class SGNOTorchApeWrapper(nn.Module):
@@ -752,78 +508,100 @@ class SGNOTorchApeWrapper(nn.Module):
         self.initial_step = int(initial_step)
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
-        dev = u.device
-        dtp = u.dtype
+        device = u.device
+        dtype = u.dtype
 
         if self.spatial_dim == 1:
             if u.ndim == 3:
-                B, C, X = u.shape
                 if self.initial_step != 1:
-                    raise ValueError('When initial_step > 1, please provide history with shape B T C X or B T X C')
+                    raise ValueError("history input is required when initial_step > 1")
                 base = u
                 x = u.permute(0, 2, 1).contiguous()
             elif u.ndim == 4:
-                B, T, C, X = u.shape
-                if T != self.initial_step:
-                    raise ValueError('The history length T must equal initial_step')
+                batch, steps, channels, x_size = u.shape
+                if steps != self.initial_step:
+                    raise ValueError("history length must equal initial_step")
                 base = u[:, -1].contiguous()
-                x = u.permute(0, 3, 2, 1).contiguous().view(B, X, C * T)
+                x = u.permute(0, 3, 2, 1).contiguous().view(batch, x_size, channels * steps)
             else:
-                raise ValueError('For 1D input, only B C X, B T C X, or B T X C are supported')
-
-            grid = _make_grid_1d(x.shape[0], x.shape[1], dev, dtp)
-            delta = self.core(x, grid)
-            delta = delta.squeeze(-2).permute(0, 2, 1).contiguous()
-            delta = delta.to(dtype=base.dtype)
-            return base + delta
+                raise ValueError("1D input must have shape B C X or B T C X")
+            grid = _make_grid_1d(x.shape[0], x.shape[1], device, dtype)
+            delta = self.core(x, grid).squeeze(-2).permute(0, 2, 1).contiguous()
+            return base + delta.to(dtype=base.dtype)
 
         if self.spatial_dim == 2:
             if u.ndim == 4:
-                B, C, X, Y = u.shape
                 if self.initial_step != 1:
-                    raise ValueError('When initial_step > 1, please provide history with shape B T C X Y or B T X Y C')
+                    raise ValueError("history input is required when initial_step > 1")
                 base = u
                 x = u.permute(0, 2, 3, 1).contiguous()
             elif u.ndim == 5:
-                B, T, C, X, Y = u.shape
-                if T != self.initial_step:
-                    raise ValueError('The history length T must equal initial_step')
+                batch, steps, channels, x_size, y_size = u.shape
+                if steps != self.initial_step:
+                    raise ValueError("history length must equal initial_step")
                 base = u[:, -1].contiguous()
-                x = u.permute(0, 3, 4, 2, 1).contiguous().view(B, X, Y, C * T)
+                x = u.permute(0, 3, 4, 2, 1).contiguous().view(batch, x_size, y_size, channels * steps)
             else:
-                raise ValueError('For 2D input, only B C X Y, B T C X Y, or B T X Y C are supported')
-
-            grid = _make_grid_2d(x.shape[0], x.shape[1], x.shape[2], dev, dtp)
-            delta = self.core(x, grid)
-            delta = delta.squeeze(-2).permute(0, 3, 1, 2).contiguous()
-            delta = delta.to(dtype=base.dtype)
-            return base + delta
+                raise ValueError("2D input must have shape B C X Y or B T C X Y")
+            grid = _make_grid_2d(x.shape[0], x.shape[1], x.shape[2], device, dtype)
+            delta = self.core(x, grid).squeeze(-2).permute(0, 3, 1, 2).contiguous()
+            return base + delta.to(dtype=base.dtype)
 
         if self.spatial_dim == 3:
             if u.ndim == 5:
-                B, C, X, Y, Z = u.shape
                 if self.initial_step != 1:
-                    raise ValueError(
-                        'When initial_step > 1, please provide history with shape B T C X Y Z or B T X Y Z C'
-                    )
+                    raise ValueError("history input is required when initial_step > 1")
                 base = u
                 x = u.permute(0, 2, 3, 4, 1).contiguous()
             elif u.ndim == 6:
-                B, T, C, X, Y, Z = u.shape
-                if T != self.initial_step:
-                    raise ValueError('The history length T must equal initial_step')
+                batch, steps, channels, x_size, y_size, z_size = u.shape
+                if steps != self.initial_step:
+                    raise ValueError("history length must equal initial_step")
                 base = u[:, -1].contiguous()
-                x = u.permute(0, 3, 4, 5, 2, 1).contiguous().view(B, X, Y, Z, C * T)
+                x = u.permute(0, 3, 4, 5, 2, 1).contiguous().view(
+                    batch,
+                    x_size,
+                    y_size,
+                    z_size,
+                    channels * steps,
+                )
             else:
-                raise ValueError('For 3D input, only B C X Y Z, B T C X Y Z, or B T X Y Z C are supported')
+                raise ValueError("3D input must have shape B C X Y Z or B T C X Y Z")
+            grid = _make_grid_3d(x.shape[0], x.shape[1], x.shape[2], x.shape[3], device, dtype)
+            delta = self.core(x, grid).squeeze(-2).permute(0, 4, 1, 2, 3).contiguous()
+            return base + delta.to(dtype=base.dtype)
 
-            grid = _make_grid_3d(x.shape[0], x.shape[1], x.shape[2], x.shape[3], dev, dtp)
-            delta = self.core(x, grid)
-            delta = delta.squeeze(-2).permute(0, 4, 1, 2, 3).contiguous()
-            delta = delta.to(dtype=base.dtype)
-            return base + delta
+        raise ValueError("num_spatial_dims must be 1, 2, or 3")
 
-        raise ValueError('unsupported spatial_dim')
+
+def _parse_value(value: str):
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if re.fullmatch(r"-?\d+(\.\d+)?([eE]-?\d+)?", value):
+        return float(value)
+    return value
+
+
+def _parse_network_config(network_config: str) -> Dict[str, Any]:
+    parts = [p.strip() for p in str(network_config or "").split(";") if p.strip()]
+    if not parts:
+        raise ValueError("network_config must start with sgno_canonical")
+    if parts[0].lower() != "sgno_canonical":
+        raise ValueError("only sgno_canonical is supported")
+
+    cfg: Dict[str, Any] = {}
+    for part in parts[1:]:
+        if "=" not in part:
+            raise ValueError("sgno_canonical uses key=value parameters only")
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        if key not in {"width", "modes", "n_blocks", "initial_step"}:
+            raise ValueError(
+                "sgno_canonical exposes only width, modes, n_blocks, and initial_step; "
+                f"got {key!r}"
+            )
+        cfg[key] = _parse_value(value.strip())
+    return cfg
 
 
 def build_sgno_from_config(
@@ -832,22 +610,12 @@ def build_sgno_from_config(
     num_points: int,
     num_channels: int,
 ) -> nn.Module:
+    del num_points
     cfg = _parse_network_config(network_config)
-
-    width = int(cfg.get('width', 64))
-    modes = int(cfg.get('modes', 16))
-    n_blocks = int(cfg.get('n_blocks', 4))
-    initial_step = int(cfg.get('initial_step', 1))
-    dt = float(cfg.get('dt', 1.0))
-    inner_steps = int(cfg.get('inner_steps', 1))
-
-    use_beta = bool(cfg.get('use_beta', False))
-    filter_type = str(cfg.get('filter_type', 'smooth'))
-    filter_strength = float(cfg.get('filter_strength', 2.0))
-    filter_order = int(cfg.get('filter_order', 8))
-    padding = int(cfg.get('padding', 2))
-    alpha_w = float(cfg.get('alpha_w', 1.0))
-    alpha_g = float(cfg.get('alpha_g', 1.0))
+    width = int(cfg.get("width", 64))
+    modes = int(cfg.get("modes", 16))
+    n_blocks = int(cfg.get("n_blocks", 4))
+    initial_step = int(cfg.get("initial_step", 1))
 
     sd = int(num_spatial_dims)
     if sd == 1:
@@ -856,16 +624,7 @@ def build_sgno_from_config(
             modes=modes,
             width=width,
             initial_step=initial_step,
-            dt=dt,
-            use_beta=use_beta,
-            filter_type=filter_type,
-            filter_strength=filter_strength,
-            filter_order=filter_order,
-            padding=padding,
             n_blocks=n_blocks,
-            alpha_w=alpha_w,
-            alpha_g=alpha_g,
-            inner_steps=inner_steps,
         )
     elif sd == 2:
         core = SGNO2d(
@@ -874,16 +633,7 @@ def build_sgno_from_config(
             modes2=modes,
             width=width,
             initial_step=initial_step,
-            dt=dt,
-            use_beta=use_beta,
-            filter_type=filter_type,
-            filter_strength=filter_strength,
-            filter_order=filter_order,
-            padding=padding,
             n_blocks=n_blocks,
-            alpha_w=alpha_w,
-            alpha_g=alpha_g,
-            inner_steps=inner_steps,
         )
     elif sd == 3:
         core = SGNO3d(
@@ -893,18 +643,108 @@ def build_sgno_from_config(
             modes3=modes,
             width=width,
             initial_step=initial_step,
-            dt=dt,
-            use_beta=use_beta,
-            filter_type=filter_type,
-            filter_strength=filter_strength,
-            filter_order=filter_order,
-            padding=padding,
             n_blocks=n_blocks,
-            alpha_w=alpha_w,
-            alpha_g=alpha_g,
-            inner_steps=inner_steps,
         )
     else:
-        raise ValueError('num_spatial_dims must be 1 2 or 3')
+        raise ValueError("num_spatial_dims must be 1, 2, or 3")
 
     return SGNOTorchApeWrapper(core=core, spatial_dim=sd, initial_step=initial_step)
+
+
+def _flatten_tensor(t: torch.Tensor) -> List[float]:
+    return t.detach().reshape(-1).cpu().tolist()
+
+
+def _summary_stats(values: Iterable[float]) -> Dict[str, float]:
+    xs = list(float(v) for v in values)
+    if not xs:
+        return {"min": float("nan"), "median": float("nan"), "p95": float("nan")}
+    x = torch.tensor(xs, dtype=torch.float64)
+    return {
+        "min": float(torch.min(x).item()),
+        "median": float(torch.median(x).item()),
+        "p95": float(torch.quantile(x, 0.95).item()),
+    }
+
+
+def _conv1x1_spectral_norm(conv: nn.Module) -> float:
+    weight = getattr(conv, "weight", None)
+    if weight is None and hasattr(conv, "parametrizations"):
+        weight = conv.weight
+    if weight is None:
+        return float("nan")
+    mat = weight.detach().reshape(weight.shape[0], -1).cpu()
+    return float(torch.linalg.matrix_norm(mat, ord=2).item())
+
+
+def summarize_gain_audit(model: nn.Module) -> Dict[str, Any]:
+    core = model.core if hasattr(model, "core") else model
+    etds = getattr(core, "etds", [])
+    gs = getattr(core, "gs", [])
+
+    gamma_vals: List[float] = []
+    mu_vals: List[float] = []
+    forcing_norm_vals: List[float] = []
+    q_delta_vals: List[float] = []
+    bypass_norm_vals: List[float] = []
+    adaptive_damp_vals: List[float] = []
+    adaptive_budget_vals: List[float] = []
+
+    for etd in etds:
+        if isinstance(etd, SpectralETD1d):
+            lam = etd._lambda("cpu")
+            gamma_vals.extend(_flatten_tensor(-lam.real))
+            mix = etd._mix_projected("cpu").permute(2, 0, 1)
+            mu_vals.extend(_flatten_tensor(torch.linalg.matrix_norm(mix, ord=2)))
+            adaptive_budget_vals.extend(_flatten_tensor(etd._injection_budget("cpu")))
+            adaptive_damp_vals.extend(_flatten_tensor(etd._damping_profile("cpu")))
+        elif isinstance(etd, SpectralETD2d):
+            lam_pos, lam_neg = etd._lambda("cpu")
+            gamma_vals.extend(_flatten_tensor(-lam_pos.real))
+            gamma_vals.extend(_flatten_tensor(-lam_neg.real))
+            adaptive_budget_vals.extend(_flatten_tensor(etd._injection_budget("cpu")))
+            adaptive_damp_vals.extend(_flatten_tensor(etd._damping_profile("cpu")))
+            for mix in [etd._project_mix(etd.mix_pos.to("cpu")), etd._project_mix(etd.mix_neg.to("cpu"))]:
+                mats = mix.permute(2, 3, 0, 1).reshape(-1, etd.channels, etd.channels)
+                mu_vals.extend(_flatten_tensor(torch.linalg.matrix_norm(mats, ord=2)))
+        elif isinstance(etd, SpectralETD3d):
+            for log_decay in [etd.log_decay1, etd.log_decay2, etd.log_decay3, etd.log_decay4]:
+                lam = etd._lam_block(log_decay.detach().cpu(), "cpu")
+                gamma_vals.extend(_flatten_tensor(-lam.real))
+            adaptive_budget_vals.extend(_flatten_tensor(etd._injection_budget("cpu")))
+            adaptive_damp_vals.extend(_flatten_tensor(etd._damping_profile("cpu")))
+            for mix in [
+                etd._project_mix(etd.mix1.to("cpu")),
+                etd._project_mix(etd.mix2.to("cpu")),
+                etd._project_mix(etd.mix3.to("cpu")),
+                etd._project_mix(etd.mix4.to("cpu")),
+            ]:
+                mats = mix.permute(2, 3, 4, 0, 1).reshape(-1, etd.channels, etd.channels)
+                mu_vals.extend(_flatten_tensor(torch.linalg.matrix_norm(mats, ord=2)))
+
+    for g in gs:
+        for layer in g.modules():
+            if isinstance(layer, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+                forcing_norm_vals.append(_conv1x1_spectral_norm(layer))
+
+    for b in getattr(core, "bs", []) or []:
+        bypass_norm_vals.append(_conv1x1_spectral_norm(b))
+
+    if gamma_vals and mu_vals and forcing_norm_vals and etds:
+        gamma_min = min(gamma_vals)
+        mu_max = max(mu_vals)
+        l_n = max(forcing_norm_vals)
+        for etd in etds:
+            dt = float(etd.dt)
+            q = math.exp(-gamma_min * dt) + mu_max * l_n * (1.0 - math.exp(-gamma_min * dt)) / gamma_min
+            q_delta_vals.append(float(q))
+
+    return {
+        "gamma_min": _summary_stats(gamma_vals),
+        "mu_max": _summary_stats(mu_vals),
+        "forcing_norm_proxy": _summary_stats(forcing_norm_vals),
+        "adaptive_damping_profile": _summary_stats(adaptive_damp_vals),
+        "adaptive_injection_budget": _summary_stats(adaptive_budget_vals),
+        "skip_norm": _summary_stats(bypass_norm_vals),
+        "q_delta": _summary_stats(q_delta_vals),
+    }

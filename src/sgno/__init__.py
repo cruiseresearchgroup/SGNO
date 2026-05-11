@@ -10,6 +10,7 @@ from .sgno import (
     SGNO3d,
     SGNOTorchApeWrapper,
     build_sgno_from_config,
+    summarize_gain_audit,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "SGNO3d",
     "SGNOTorchApeWrapper",
     "build_sgno_from_config",
+    "summarize_gain_audit",
 ]
