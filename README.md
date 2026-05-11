@@ -4,7 +4,9 @@
 
 This repository provides a PyTorch implementation of the Spectral Generator Neural Operator for one-step supervised training and long-horizon autoregressive PDE rollouts.
 
-SGNO maps a current PDE state to the next state through a residual neural operator. The input state is lifted with coordinate features, passed through stacked SGNO blocks, and projected back to a physical-state increment. Each block uses a spectral evolution update with a real-valued nonpositive diagonal generator, complex spectral correction mixing, bounded injection budgets, and pointwise local mixing.
+SGNO maps the current state and coordinates to the next state through a residual neural operator. The state-coordinate input is lifted to a latent field, passed through stacked SGNO layers, and projected to a residual update that is added to the current state.
+
+Each SGNO layer combines a local path with a spectral generator branch. The spectral branch separates gain-controlled spectral carry from a learned correction pathway using a real-valued nonpositive diagonal generator, complex-valued spectral mixing, and bounded injection budgets.
 
 The implementation targets periodic linear and semilinear evolution PDEs with Fourier-structured linear dynamics.
 
