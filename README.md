@@ -1,6 +1,6 @@
 # SGNO
 
-![SGNO architecture](assets/sgno_arch.png)
+![SGNO architecture](assets/sgno.png)
 
 This repository provides a PyTorch implementation of the Spectral Generator Neural Operator for one-step supervised training and long-horizon autoregressive PDE rollouts.
 
