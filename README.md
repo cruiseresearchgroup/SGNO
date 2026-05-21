@@ -1,4 +1,4 @@
-# SGNO
+# SGNO: Spectral Generator Neural Operator for Stable Long-Horizon PDE Rollouts
 
 ![SGNO architecture](assets/sgno.png)
 
