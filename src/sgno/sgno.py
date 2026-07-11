@@ -19,11 +19,69 @@ def _inv_softplus(x: float, eps: float = 1e-6) -> float:
     return math.log(math.expm1(x))
 
 
-def _phi1(z: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _phi1(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Stable complex-safe evaluation of phi_1 with a finite gradient at zero."""
+
     small = torch.abs(z) < eps
-    series = 1.0 + z * 0.5 + (z * z) / 6.0
-    safe = (torch.exp(z) - 1.0) / z
-    return torch.where(small, series, safe)
+    z_safe = torch.where(small, torch.ones_like(z), z)
+    ratio = torch.expm1(z) / z_safe
+    series = (
+        1.0
+        + z / 2.0
+        + z.square() / 6.0
+        + z.pow(3) / 24.0
+        + z.pow(4) / 120.0
+        + z.pow(5) / 720.0
+    )
+    return torch.where(small, series, ratio)
+
+
+def _project_rfft_hermitian_boundaries(
+    spectrum: torch.Tensor,
+    spatial_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Project the stored DC/Nyquist planes onto the real-FFT range.
+
+    A multidimensional one-sided real FFT only has an in-storage conjugacy
+    constraint on the last-axis DC plane and, for even grids, its Nyquist
+    plane.  ``irfftn`` applies this projection implicitly.  Making it explicit
+    is provided as an audit/reference operation: the production branch relies
+    on the identical implicit projection in ``irfft`` to avoid a redundant
+    boundary copy.  It preserves the legacy parameter layout, checkpoints,
+    effective forward map, and parameter count.
+    """
+
+    shape = tuple(int(size) for size in spatial_shape)
+    if not shape or any(size < 1 for size in shape):
+        raise ValueError("spatial_shape must contain positive axis lengths")
+    expected_spectral_shape = shape[:-1] + (shape[-1] // 2 + 1,)
+    if tuple(spectrum.shape[-len(shape) :]) != expected_spectral_shape:
+        raise ValueError(
+            "stored rFFT shape does not match the requested spatial shape: "
+            f"got {tuple(spectrum.shape[-len(shape):])}, expected {expected_spectral_shape}"
+        )
+
+    boundaries = [0]
+    if shape[-1] % 2 == 0:
+        boundaries.append(shape[-1] // 2)
+
+    projected_planes = []
+    num_full_axes = len(shape) - 1
+    for boundary in boundaries:
+        plane = spectrum.select(-1, boundary)
+        partner = plane
+        first_full_axis = plane.ndim - num_full_axes
+        for offset, axis_size in enumerate(shape[:-1]):
+            indices = torch.remainder(
+                -torch.arange(axis_size, device=spectrum.device),
+                axis_size,
+            )
+            partner = partner.index_select(first_full_axis + offset, indices)
+        projected_planes.append(0.5 * (plane + partner.conj()))
+
+    boundary_indices = torch.tensor(boundaries, device=spectrum.device, dtype=torch.long)
+    source = torch.stack(projected_planes, dim=-1)
+    return torch.index_copy(spectrum, -1, boundary_indices, source)
 
 
 def _radial_coord_nd(shape, device, dtype=torch.float32):
@@ -116,6 +174,8 @@ class SpectralETD1d(nn.Module):
         super().__init__()
         self.channels = int(channels)
         self.modes1 = int(modes1)
+        if self.channels < 1 or self.modes1 < 1:
+            raise ValueError("channels and modes1 must be positive")
         self.dt = _CANONICAL_DT
 
         self.log_decay = nn.Parameter(torch.randn(channels, modes1) * 0.1)
@@ -154,6 +214,8 @@ class SpectralETD1d(nn.Module):
         return _project_mixer(self.mix.to(device=device), self.channels)
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        if g.shape != v.shape:
+            raise ValueError(f"v and g must have the same shape, got {v.shape} and {g.shape}")
         _, c, x_size = v.shape
         if c != self.channels:
             raise ValueError(f"expected {self.channels} channels, got {c}")
@@ -162,7 +224,11 @@ class SpectralETD1d(nn.Module):
         g_hat = torch.fft.rfft(g.float())
         out_hat = torch.zeros_like(v_hat)
 
-        m1 = min(self.modes1, v_hat.size(-1))
+        if self.modes1 > v_hat.size(-1):
+            raise ValueError(
+                f"modes1={self.modes1} exceeds {v_hat.size(-1)} stored rFFT bins"
+            )
+        m1 = self.modes1
         lam = self._lambda(v.device)[:, :m1]
         z = (_CANONICAL_DT * lam).unsqueeze(0)
 
@@ -175,6 +241,8 @@ class SpectralETD1d(nn.Module):
         forcing = (_CANONICAL_DT * _phi1(z)) * gmix
         budget = self._injection_budget(v.device)[:, :m1].view(1, self.channels, m1)
         out_hat[:, :, :m1] = lin + forcing * budget
+        # irfft realizes F_r^{-1} P_H: imaginary self-conjugate components are
+        # projected away without a redundant explicit boundary copy.
         return torch.fft.irfft(out_hat, n=x_size)
 
 
@@ -184,6 +252,8 @@ class SpectralETD2d(nn.Module):
         self.channels = int(channels)
         self.modes1 = int(modes1)
         self.modes2 = int(modes2)
+        if self.channels < 1 or min(self.modes1, self.modes2) < 1:
+            raise ValueError("channels, modes1, and modes2 must be positive")
         self.dt = _CANONICAL_DT
 
         self.log_decay_pos = nn.Parameter(torch.randn(channels, modes1, modes2) * 0.1)
@@ -227,6 +297,8 @@ class SpectralETD2d(nn.Module):
         return _project_mixer(mix, self.channels)
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        if g.shape != v.shape:
+            raise ValueError(f"v and g must have the same shape, got {v.shape} and {g.shape}")
         _, c, x_size, y_size = v.shape
         if c != self.channels:
             raise ValueError(f"expected {self.channels} channels, got {c}")
@@ -235,8 +307,16 @@ class SpectralETD2d(nn.Module):
         g_hat = torch.fft.rfft2(g.float())
         out_hat = torch.zeros_like(v_hat)
 
-        m1 = min(self.modes1, v_hat.size(-2))
-        m2 = min(self.modes2, v_hat.size(-1))
+        if 2 * self.modes1 > x_size:
+            raise ValueError(
+                f"modes1={self.modes1} makes positive/negative full-axis blocks overlap for N={x_size}"
+            )
+        if self.modes2 > v_hat.size(-1):
+            raise ValueError(
+                f"modes2={self.modes2} exceeds {v_hat.size(-1)} stored rFFT bins"
+            )
+        m1 = self.modes1
+        m2 = self.modes2
 
         lam_pos, lam_neg = self._lambda(v.device)
         lam_pos = lam_pos[:, :m1, :m2]
@@ -258,6 +338,7 @@ class SpectralETD2d(nn.Module):
         gmn = torch.einsum("bixy,ioxy->boxy", gn, mixn)
         out_hat[:, :, -m1:, :m2] = torch.exp(z_neg) * vn + (_CANONICAL_DT * _phi1(z_neg)) * gmn * budget
 
+        # irfft2 implicitly applies the Hermitian boundary projection P_H.
         return torch.fft.irfft2(out_hat, s=(x_size, y_size))
 
 
@@ -268,6 +349,8 @@ class SpectralETD3d(nn.Module):
         self.modes1 = int(modes1)
         self.modes2 = int(modes2)
         self.modes3 = int(modes3)
+        if self.channels < 1 or min(self.modes1, self.modes2, self.modes3) < 1:
+            raise ValueError("channels and all mode counts must be positive")
         self.dt = _CANONICAL_DT
 
         shape = (channels, modes1, modes2, modes3)
@@ -323,6 +406,8 @@ class SpectralETD3d(nn.Module):
         return _project_mixer(mix, self.channels)
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        if g.shape != v.shape:
+            raise ValueError(f"v and g must have the same shape, got {v.shape} and {g.shape}")
         _, c, x_size, y_size, z_size = v.shape
         if c != self.channels:
             raise ValueError(f"expected {self.channels} channels, got {c}")
@@ -331,9 +416,18 @@ class SpectralETD3d(nn.Module):
         g_hat = torch.fft.rfftn(g.float(), dim=[-3, -2, -1])
         out_hat = torch.zeros_like(v_hat)
 
-        m1 = min(self.modes1, v_hat.size(-3))
-        m2 = min(self.modes2, v_hat.size(-2))
-        m3 = min(self.modes3, v_hat.size(-1))
+        if 2 * self.modes1 > x_size or 2 * self.modes2 > y_size:
+            raise ValueError(
+                "positive/negative full-axis spectral blocks overlap; "
+                f"modes=({self.modes1},{self.modes2}) shape=({x_size},{y_size})"
+            )
+        if self.modes3 > v_hat.size(-1):
+            raise ValueError(
+                f"modes3={self.modes3} exceeds {v_hat.size(-1)} stored rFFT bins"
+            )
+        m1 = self.modes1
+        m2 = self.modes2
+        m3 = self.modes3
         budget = self._injection_budget(v.device)[:, :m1, :m2, :m3].view(1, self.channels, m1, m2, m3)
 
         def apply_block(vs, gs, lam, mix):
@@ -372,6 +466,7 @@ class SpectralETD3d(nn.Module):
             self.mix4,
         )
 
+        # irfftn implicitly applies the Hermitian boundary projection P_H.
         return torch.fft.irfftn(out_hat, s=(x_size, y_size, z_size))
 
 
@@ -739,12 +834,21 @@ def summarize_gain_audit(model: nn.Module) -> Dict[str, Any]:
             q = math.exp(-gamma_min * dt) + mu_max * l_n * (1.0 - math.exp(-gamma_min * dt)) / gamma_min
             q_delta_vals.append(float(q))
 
+    q_delta_summary = _summary_stats(q_delta_vals)
     return {
+        "scope_warning": (
+            "q_delta is a branch-only heuristic proxy. It omits bypass, injection budget, "
+            "activation, lift, projection, and the outer residual, so it is not the paper's "
+            "full-map Lipschitz bound and cannot certify rollout stability."
+        ),
+        "certifies_full_map": False,
         "gamma_min": _summary_stats(gamma_vals),
         "mu_max": _summary_stats(mu_vals),
         "forcing_norm_proxy": _summary_stats(forcing_norm_vals),
         "adaptive_damping_profile": _summary_stats(adaptive_damp_vals),
         "adaptive_injection_budget": _summary_stats(adaptive_budget_vals),
         "skip_norm": _summary_stats(bypass_norm_vals),
-        "q_delta": _summary_stats(q_delta_vals),
+        "q_delta_heuristic": q_delta_summary,
+        "q_delta": q_delta_summary,
     }
+
