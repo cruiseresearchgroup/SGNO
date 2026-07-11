@@ -1,149 +1,258 @@
+from __future__ import annotations
+
 import argparse
 import json
 import math
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import torch
+
 from sgno import build_sgno_from_config
+from sgno.data import load_trajectory_split
 
-def _load_npz(path: str):
-    d = np.load(path)
-    keys = set(d.files)
-    if 'test' in keys:
-        return d['test']
-    if 'u' in keys:
-        return d['u']
-    raise ValueError('NPZ must contain test or u')
 
-def _nrmse(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12):
-    num = torch.linalg.norm(a - b)
-    den = torch.linalg.norm(b) + eps
-    return (num / den).item()
+def _initial_step_from_config(network_config: str) -> int:
+    for part in network_config.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        if key.strip().lower() == "initial_step":
+            return int(float(value.strip()))
+    return 1
 
-def _gmean(errs: list[float], cap: float = 0.0, eps: float = 1e-12):
-    if not errs:
+
+def _nrmse(prediction: torch.Tensor, reference: torch.Tensor, eps: float = 1.0e-12) -> float:
+    numerator = torch.linalg.norm(prediction - reference)
+    denominator = torch.linalg.norm(reference) + eps
+    return float((numerator / denominator).item())
+
+
+def _gmean(values: list[float] | np.ndarray, cap: float = 0.0, eps: float = 1.0e-12) -> float:
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0 or not np.isfinite(array).all():
         return math.nan
-    x = np.asarray(errs, dtype=np.float64)
-    if cap and cap > 0:
-        x = np.minimum(x, float(cap))
-    return float(np.exp(np.mean(np.log(x + float(eps)))))
+    if cap > 0:
+        array = np.minimum(array, float(cap))
+    return float(np.exp(np.mean(np.log(array + float(eps)))))
 
-def _stable_step(errs: list[float], tau: float, horizon: int):
-    thr = float(tau)
-    for i, e in enumerate(errs, start=1):
-        if not math.isfinite(e):
-            return int(i)
-        if e > thr:
-            return int(i)
-    return int(horizon)
 
-def _load_checkpoint(path: str):
+def _stable_step(values: list[float] | np.ndarray, threshold: float) -> tuple[int, bool]:
+    array = np.asarray(values, dtype=np.float64)
+    bad = np.flatnonzero(~np.isfinite(array) | (array > float(threshold)))
+    if bad.size:
+        return int(bad[0] + 1), False
+    return int(array.size), True
+
+
+def _first_nonfinite_step(values: list[float] | np.ndarray) -> int | None:
+    bad = np.flatnonzero(~np.isfinite(np.asarray(values, dtype=np.float64)))
+    return int(bad[0] + 1) if bad.size else None
+
+
+def _load_checkpoint(path: str | Path) -> dict[str, Any]:
     try:
-        return torch.load(path, map_location='cpu', weights_only=True)
+        return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
-        return torch.load(path, map_location='cpu')
+        return torch.load(path, map_location="cpu")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--config', required=True)
-    ap.add_argument('--data', required=True)
-    ap.add_argument('--ckpt', required=True)
-    ap.add_argument('--out', required=True)
-    ap.add_argument('--steps', type=int, default=200)
-    ap.add_argument('--tau', type=float, default=0.1)
-    ap.add_argument('--cap', type=float, default=0.0)
-    ap.add_argument('--max_traj', type=int, default=0)
-    ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    args = ap.parse_args()
 
-    with open(args.config, 'r', encoding='utf-8') as f:
-        cfg = json.load(f)
+def _assert_checkpoint_matches_config(checkpoint: dict[str, Any], config: dict[str, Any]) -> None:
+    expected = {
+        "network_config": str(config["network_config"]),
+        "spatial_dim": int(config["spatial_dim"]),
+        "num_channels": int(config["num_channels"]),
+    }
+    for key, value in expected.items():
+        if key not in checkpoint:
+            raise ValueError(f"checkpoint is missing required metadata {key!r}")
+        if checkpoint[key] != value:
+            raise ValueError(
+                f"checkpoint/config mismatch for {key}: "
+                f"checkpoint={checkpoint[key]!r}, config={value!r}"
+            )
 
-    spatial_dim = int(cfg['spatial_dim'])
-    num_channels = int(cfg['num_channels'])
-    num_points = int(cfg.get('num_points', 0))
-    network_config = str(cfg['network_config'])
 
-    ck = _load_checkpoint(args.ckpt)
-    model = build_sgno_from_config(network_config, spatial_dim, num_points, num_channels).to(args.device)
-    model.load_state_dict(ck['model'], strict=True)
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--tau", type=float, default=0.2)
+    parser.add_argument("--cap", type=float, default=0.0)
+    parser.add_argument("--max-traj", type=int, default=0)
+    parser.add_argument("--split", choices=("train", "val", "test", "all"), default="test")
+    parser.add_argument("--train-fraction", type=float, default=0.8)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    if args.steps < 1:
+        raise ValueError("steps must be positive")
+    if args.max_traj < 0:
+        raise ValueError("max_traj cannot be negative")
+
+    with open(args.config, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    checkpoint = _load_checkpoint(args.ckpt)
+    _assert_checkpoint_matches_config(checkpoint, config)
+
+    spatial_dim = int(config["spatial_dim"])
+    num_channels = int(config["num_channels"])
+    num_points = int(config.get("num_points", 0))
+    network_config = str(config["network_config"])
+    initial_step = _initial_step_from_config(network_config)
+
+    trajectories, selected_split = load_trajectory_split(
+        args.data,
+        split=args.split,
+        split_metadata=checkpoint.get("data_split"),
+        train_fraction=args.train_fraction,
+    )
+    trajectories = np.asarray(trajectories).astype(np.float32, copy=False)
+    expected_ndim = spatial_dim + 3
+    if trajectories.ndim != expected_ndim:
+        raise ValueError(
+            f"expected trajectory rank {expected_ndim} for {spatial_dim}D data, "
+            f"got shape {trajectories.shape}"
+        )
+    if int(trajectories.shape[2]) != num_channels:
+        raise ValueError(
+            f"expected {num_channels} channels, got {int(trajectories.shape[2])}"
+        )
+    if not np.isfinite(trajectories).all():
+        raise ValueError("evaluation trajectories contain non-finite values")
+
+    num_trajectories = int(trajectories.shape[0])
+    if args.max_traj > 0:
+        num_trajectories = min(num_trajectories, int(args.max_traj))
+    if num_trajectories < 1:
+        raise ValueError("selected evaluation split is empty")
+
+    total_times = int(trajectories.shape[1])
+    horizon = min(int(args.steps), total_times - initial_step)
+    if horizon < 1:
+        raise ValueError("trajectory does not contain a prediction step after the history window")
+
+    device = torch.device(args.device)
+    model = build_sgno_from_config(
+        network_config,
+        spatial_dim,
+        num_points,
+        num_channels,
+    ).to(device)
+    model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 
-    u = _load_npz(args.data).astype(np.float32, copy=False)
-    u = torch.from_numpy(u)
-
-    initial_step = 1
-    for part in network_config.split(';'):
-        if '=' in part:
-            k, v = part.split('=', 1)
-            if k.strip().lower() == 'initial_step':
-                initial_step = int(float(v.strip()))
-                break
-
-    n_traj = int(u.shape[0])
-    if args.max_traj and args.max_traj > 0:
-        n_traj = min(n_traj, int(args.max_traj))
-
-    t_total = int(u.shape[1])
-    horizon = min(int(args.steps), t_total - initial_step)
-    horizon = max(0, horizon)
-
-    per_traj = []
-    all_errs = []
-    step_errs = [[] for _ in range(horizon)]
+    u = torch.from_numpy(trajectories)
+    per_trajectory: list[dict[str, Any]] = []
+    all_errors: list[float] = []
+    step_errors: list[list[float]] = [[] for _ in range(horizon)]
 
     with torch.no_grad():
-        for i in range(n_traj):
-            hist = u[i, :initial_step].unsqueeze(0).to(args.device)
-            errs = []
-            for t in range(horizon):
-                y = model(hist)
-                gt = u[i, initial_step + t].to(args.device)
-                e = _nrmse(y, gt)
-                errs.append(float(e))
-                step_errs[t].append(float(e))
+        for trajectory_index in range(num_trajectories):
+            history = u[trajectory_index, :initial_step].unsqueeze(0).to(device)
+            errors: list[float] = []
+            for step in range(horizon):
+                prediction = model(history)
+                reference = u[trajectory_index, initial_step + step].to(device)
+                error = _nrmse(prediction, reference)
+                errors.append(error)
+                step_errors[step].append(error)
                 if initial_step == 1:
-                    hist = y.unsqueeze(1)
+                    history = prediction.unsqueeze(1)
                 else:
-                    hist = torch.cat([hist[:, 1:], y.unsqueeze(1)], dim=1)
-            g = _gmean(errs[: min(100, len(errs))], cap=args.cap)
-            s = _stable_step(errs, tau=args.tau, horizon=horizon)
-            fin = float(errs[-1]) if errs else math.nan
-            per_traj.append({'gmean100': g, 'stable_step': s, 'final_nrmse': fin})
-            all_errs.extend(errs)
+                    history = torch.cat([history[:, 1:], prediction.unsqueeze(1)], dim=1)
+
+            stable_step, stable_through_horizon = _stable_step(errors, args.tau)
+            prefix_length = min(100, horizon)
+            tail_length = max(0, min(200, horizon) - 100)
+            per_trajectory.append(
+                {
+                    "gmean100": _gmean(errors[:100], args.cap) if horizon >= 100 else None,
+                    "gmean_prefix": _gmean(errors[:prefix_length], args.cap),
+                    "prefix_length": prefix_length,
+                    "tail_gmean_101_200": _gmean(errors[100:200], args.cap)
+                    if horizon > 100
+                    else None,
+                    "tail_length": tail_length,
+                    "stable_step": stable_step,
+                    "stable_through_horizon": stable_through_horizon,
+                    "final_nrmse": float(errors[-1]),
+                    "max_nrmse": float(np.max(np.asarray(errors, dtype=np.float64))),
+                    "first_nonfinite_step": _first_nonfinite_step(errors),
+                }
+            )
+            all_errors.extend(errors)
 
     mean_nrmse_by_step = [
-        float(np.mean(np.asarray(xs, dtype=np.float64))) if xs else math.nan
-        for xs in step_errs
+        float(np.mean(np.asarray(values, dtype=np.float64))) for values in step_errors
     ]
-    gmean_steps = mean_nrmse_by_step[: min(100, len(mean_nrmse_by_step))]
-    paper_gmean100 = _gmean(gmean_steps, cap=args.cap)
-    paper_stable_step = _stable_step(mean_nrmse_by_step, tau=args.tau, horizon=horizon)
+    stable_step, stable_through_horizon = _stable_step(mean_nrmse_by_step, args.tau)
+    prefix_length = min(100, horizon)
+    tail_length = max(0, min(200, horizon) - 100)
+    trajectory_gmeans = np.asarray(
+        [item["gmean_prefix"] for item in per_trajectory],
+        dtype=np.float64,
+    )
+    trajectory_stable_steps = np.asarray(
+        [item["stable_step"] for item in per_trajectory],
+        dtype=np.float64,
+    )
 
-    gmeans = np.asarray([p['gmean100'] for p in per_traj], dtype=np.float64)
-    steps_arr = np.asarray([p['stable_step'] for p in per_traj], dtype=np.float64)
-
-    out = {
-        'n_traj': int(n_traj),
-        'horizon': int(horizon),
-        'tau': float(args.tau),
-        'cap': float(args.cap),
-        'gmean100': float(paper_gmean100),
-        'stable_step': int(paper_stable_step),
-        'mean_nrmse_by_step': mean_nrmse_by_step,
-        'mean_nrmse': float(np.mean(all_errs) if all_errs else math.nan),
-        'median_nrmse': float(np.median(all_errs) if all_errs else math.nan),
-        'median_traj_gmean100': float(np.median(gmeans) if per_traj else math.nan),
-        'mean_traj_gmean100': float(np.mean(gmeans) if per_traj else math.nan),
-        'median_traj_stable_step': float(np.median(steps_arr) if per_traj else math.nan),
-        'q25_traj_stable_step': float(np.quantile(steps_arr, 0.25) if per_traj else math.nan),
-        'q75_traj_stable_step': float(np.quantile(steps_arr, 0.75) if per_traj else math.nan),
-        'per_traj': per_traj,
+    output = {
+        "split": args.split,
+        "split_metadata": selected_split,
+        "n_traj": num_trajectories,
+        "horizon": horizon,
+        "tau": float(args.tau),
+        "cap": float(args.cap),
+        "gmean100": _gmean(mean_nrmse_by_step[:100], args.cap) if horizon >= 100 else None,
+        "gmean_prefix": _gmean(mean_nrmse_by_step[:prefix_length], args.cap),
+        "prefix_length": prefix_length,
+        "tail_gmean_101_200": _gmean(mean_nrmse_by_step[100:200], args.cap)
+        if horizon > 100
+        else None,
+        "tail_length": tail_length,
+        "stable_step": stable_step,
+        "stable_through_horizon": stable_through_horizon,
+        "all_steps_finite": bool(np.isfinite(np.asarray(mean_nrmse_by_step)).all()),
+        "first_nonfinite_step": _first_nonfinite_step(mean_nrmse_by_step),
+        "final_mean_nrmse": float(mean_nrmse_by_step[-1]),
+        "max_mean_nrmse": float(np.max(np.asarray(mean_nrmse_by_step, dtype=np.float64))),
+        "mean_nrmse_by_step": mean_nrmse_by_step,
+        "mean_nrmse": float(np.mean(np.asarray(all_errors, dtype=np.float64))),
+        "median_nrmse": float(np.median(np.asarray(all_errors, dtype=np.float64))),
+        "median_traj_gmean_prefix": float(np.median(trajectory_gmeans)),
+        "mean_traj_gmean_prefix": float(np.mean(trajectory_gmeans)),
+        "median_traj_stable_step": float(np.median(trajectory_stable_steps)),
+        "q25_traj_stable_step": float(np.quantile(trajectory_stable_steps, 0.25)),
+        "q75_traj_stable_step": float(np.quantile(trajectory_stable_steps, 0.75)),
+        "per_traj": per_trajectory,
     }
 
-    with open(args.out, 'w', encoding='utf-8') as f:
-        json.dump(out, f)
+    output_path = Path(args.out)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(_json_safe(output), handle, indent=2, sort_keys=True, allow_nan=False)
+    print(output_path)
 
-    print(args.out)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+
