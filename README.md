@@ -1,3 +1,4 @@
+
 # SGNO: Spectral Generator Neural Operator for Stable Long-Horizon PDE Rollouts
 
 ![SGNO architecture](assets/sgno.png)
@@ -52,6 +53,8 @@ train and test
 u
 ```
 
+For a file containing only `u`, the first 80% of trajectories are used for training and the remaining 20% for evaluation.
+
 Layouts:
 
 ```text
@@ -80,20 +83,20 @@ Reference dimension-level settings:
 
 ## Training
 
-One-step supervised training minimizes MSE on the next state.
+One-step supervised training minimizes MSE on the next state. The canonical training protocol uses 10,000 updates, 2,000 warmup updates, cosine learning-rate decay, a peak learning rate of `1e-3`, and batch size 20.
 
 ```bash
 python scripts/train_npz.py --config configs/example_2d.json --data path/to/data.npz --out runs/example_2d
 ```
 
-The output directory contains `best.pt` and `state.json`.
+The output directory contains `final_update_10000.pt` and `state.json`.
 
 ## Evaluation
 
 Autoregressive evaluation initializes from the first test frame or history window and repeatedly applies the learned one-step map.
 
 ```bash
-python scripts/eval_npz.py --config configs/example_2d.json --data path/to/data.npz --ckpt runs/example_2d/best.pt --out runs/example_2d/eval.json --steps 200 --tau 0.1
+python scripts/eval_npz.py --config configs/example_2d.json --data path/to/data.npz --ckpt runs/example_2d/final_update_10000.pt --out runs/example_2d/eval.json --steps 200 --tau 0.2 --split test
 ```
 
 The reported `gmean100` is computed from mean nRMSE over rollout steps 1 through 100. At each step, nRMSE is averaged across evaluated trajectories first, then the geometric mean is taken over time. By default the metric is unclipped. Set `--cap` to a positive value only when clipped diagnostics are desired.
