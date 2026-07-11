@@ -4,9 +4,11 @@
   "num_points": 64,
   "network_config": "sgno_canonical;width=5;modes=10;n_blocks=9;initial_step=1",
   "train": {
-    "batch_size": 4,
-    "epochs": 5,
+    "batch_size": 20,
+    "updates": 10000,
+    "warmup_updates": 2000,
     "lr": 0.001,
+    "log_every": 100,
     "seed": 0
   }
 }
