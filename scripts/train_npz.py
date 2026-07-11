@@ -1,146 +1,246 @@
+from __future__ import annotations
+
 import argparse
 import json
-import os
 import math
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from sgno import build_sgno_from_config
+from torch.utils.data import DataLoader, Dataset
 
-def _set_seed(seed: int):
+from sgno import build_sgno_from_config
+from sgno.data import load_trajectory_splits
+
+
+def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def _load_npz(path: str):
-    d = np.load(path)
-    keys = set(d.files)
-    if "train" in keys and "test" in keys:
-        return d["train"], d["test"]
-    if "u" in keys:
-        u = d["u"]
-        n = u.shape[0]
-        k = max(1, int(0.8 * n))
-        return u[:k], u[k:]
-    raise ValueError("NPZ must contain train and test or u")
 
-def _ensure_layout(u: np.ndarray):
-    if u.ndim < 4:
-        raise ValueError("trajectory array must be at least 4D")
-    return u
+def _initial_step_from_config(network_config: str) -> int:
+    for part in network_config.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        if key.strip().lower() == "initial_step":
+            return int(float(value.strip()))
+    return 1
+
+
+def _learning_rate(
+    update_index: int,
+    *,
+    total_updates: int,
+    warmup_updates: int,
+    peak_lr: float,
+) -> float:
+    """Optax-compatible linear warmup followed by cosine decay."""
+
+    if update_index < warmup_updates:
+        return float(peak_lr) * update_index / max(1, warmup_updates)
+    decay_updates = max(1, total_updates - warmup_updates)
+    progress = min(1.0, (update_index - warmup_updates) / decay_updates)
+    return float(peak_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
 
 class TrajDataset(Dataset):
-    def __init__(self, u: np.ndarray, initial_step: int):
-        self.u = _ensure_layout(u).astype(np.float32, copy=False)
+    def __init__(self, trajectories: np.ndarray, initial_step: int):
+        self.u = np.asarray(trajectories).astype(np.float32, copy=False)
         self.initial_step = int(initial_step)
-        self.n = self.u.shape[0]
-        self.t = self.u.shape[1]
-        if self.t <= self.initial_step:
+        if self.u.ndim < 4:
+            raise ValueError("trajectory array must be at least 4D")
+        self.num_trajectories = int(self.u.shape[0])
+        self.num_times = int(self.u.shape[1])
+        if self.num_times <= self.initial_step:
             raise ValueError("T must be larger than initial_step")
 
-    def __len__(self):
-        return self.n * (self.t - self.initial_step)
+    def __len__(self) -> int:
+        return self.num_trajectories * (self.num_times - self.initial_step)
 
-    def __getitem__(self, idx: int):
-        i = idx // (self.t - self.initial_step)
-        j = idx % (self.t - self.initial_step)
-        t0 = j
-        t1 = j + self.initial_step
-        x = self.u[i, t0:t1]
-        y = self.u[i, t1]
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        trajectory = index // (self.num_times - self.initial_step)
+        start = index % (self.num_times - self.initial_step)
+        stop = start + self.initial_step
+        x = self.u[trajectory, start:stop]
+        y = self.u[trajectory, stop]
         return torch.from_numpy(x), torch.from_numpy(y)
 
-def _to_model_input(x: torch.Tensor, spatial_dim: int):
-    if spatial_dim == 1:
-        return x.permute(0, 1, 2, 3).contiguous()
-    if spatial_dim == 2:
-        return x.permute(0, 1, 2, 3, 4).contiguous()
-    if spatial_dim == 3:
-        return x.permute(0, 1, 2, 3, 4, 5).contiguous()
-    raise ValueError("spatial_dim must be 1 2 or 3")
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = ap.parse_args()
+def _resolve_training_value(cli_value, train_config: dict, key: str, default):
+    return cli_value if cli_value is not None else train_config.get(key, default)
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
 
-    spatial_dim = int(cfg["spatial_dim"])
-    num_channels = int(cfg["num_channels"])
-    num_points = int(cfg.get("num_points", 0))
-    network_config = str(cfg["network_config"])
-    train_cfg = cfg.get("train", {})
-    batch_size = int(train_cfg.get("batch_size", 4))
-    epochs = int(train_cfg.get("epochs", 5))
-    lr = float(train_cfg.get("lr", 1e-3))
-    seed = int(train_cfg.get("seed", 0))
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--updates", type=int)
+    parser.add_argument("--warmup-updates", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--log-every", type=int)
+    parser.add_argument("--train-fraction", type=float)
+    args = parser.parse_args()
+
+    with open(args.config, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    spatial_dim = int(config["spatial_dim"])
+    num_channels = int(config["num_channels"])
+    num_points = int(config.get("num_points", 0))
+    network_config = str(config["network_config"])
+    train_config = dict(config.get("train", {}))
+
+    if "epochs" in train_config and "updates" not in train_config and args.updates is None:
+        raise ValueError(
+            "epoch-based training is not the paper protocol; replace train.epochs "
+            "with train.updates (10,000 for the reported setting)"
+        )
+
+    updates = int(_resolve_training_value(args.updates, train_config, "updates", 10_000))
+    warmup_updates = int(
+        _resolve_training_value(args.warmup_updates, train_config, "warmup_updates", 2_000)
+    )
+    batch_size = int(_resolve_training_value(args.batch_size, train_config, "batch_size", 20))
+    peak_lr = float(_resolve_training_value(args.lr, train_config, "lr", 1.0e-3))
+    seed = int(_resolve_training_value(args.seed, train_config, "seed", 0))
+    log_every = int(_resolve_training_value(args.log_every, train_config, "log_every", 100))
+    train_fraction = float(
+        _resolve_training_value(args.train_fraction, train_config, "train_fraction", 0.8)
+    )
+
+    if updates < 1 or batch_size < 1 or log_every < 1:
+        raise ValueError("updates, batch_size, and log_every must be positive")
+    if not 0 <= warmup_updates < updates:
+        raise ValueError("warmup_updates must satisfy 0 <= warmup_updates < updates")
+    if peak_lr <= 0:
+        raise ValueError("lr must be positive")
 
     _set_seed(seed)
+    train, _val, _test, split_metadata = load_trajectory_splits(
+        args.data,
+        train_fraction=train_fraction,
+    )
+    expected_ndim = spatial_dim + 3
+    if train.ndim != expected_ndim:
+        raise ValueError(
+            f"expected training trajectory rank {expected_ndim} for {spatial_dim}D data, "
+            f"got shape {train.shape}"
+        )
+    if int(train.shape[2]) != num_channels:
+        raise ValueError(f"expected {num_channels} training channels, got {int(train.shape[2])}")
+    if not np.isfinite(train).all():
+        raise ValueError("training trajectories contain non-finite values")
 
-    u_train, u_test = _load_npz(args.data)
+    initial_step = _initial_step_from_config(network_config)
+    dataset = TrajDataset(train, initial_step=initial_step)
+    shuffle_generator = torch.Generator()
+    shuffle_generator.manual_seed(seed)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        generator=shuffle_generator,
+    )
+    iterator = iter(loader)
 
-    initial_step = 1
-    for part in network_config.split(";"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            if k.strip().lower() == "initial_step":
-                initial_step = int(float(v.strip()))
-                break
-
-    ds = TrajDataset(u_train, initial_step=initial_step)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
-
-    model = build_sgno_from_config(network_config, spatial_dim, num_points, num_channels).to(args.device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    device = torch.device(args.device)
+    model = build_sgno_from_config(
+        network_config,
+        spatial_dim,
+        num_points,
+        num_channels,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=peak_lr)
     loss_fn = nn.MSELoss()
 
-    os.makedirs(args.out, exist_ok=True)
-    best_path = os.path.join(args.out, "best.pt")
-    state_path = os.path.join(args.out, "state.json")
+    output_dir = Path(args.out)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / f"final_update_{updates}.pt"
+    state_path = output_dir / "state.json"
 
-    best = math.inf
-    for ep in range(1, epochs + 1):
-        model.train()
-        total = 0.0
-        n = 0
-        for x, y in dl:
-            x = x.to(args.device)
-            y = y.to(args.device)
-            x_in = x
-            y_hat = model(x_in)
-            loss = loss_fn(y_hat, y)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            total += float(loss.item())
-            n += 1
-        train_loss = total / max(1, n)
+    model.train()
+    last_loss = math.nan
+    last_lr = math.nan
+    for update_index in range(updates):
+        try:
+            x, y = next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            x, y = next(iterator)
 
-        model.eval()
-        with torch.no_grad():
-            u = torch.from_numpy(u_test[: min(4, u_test.shape[0])].astype(np.float32, copy=False))
-            if u.ndim == 4:
-                u0 = u[:, :initial_step]
-            else:
-                u0 = u[:, :initial_step]
-            x0 = u0.to(args.device)
-            y0 = torch.from_numpy(u_test[: min(4, u_test.shape[0]), initial_step].astype(np.float32, copy=False)).to(args.device)
-            y_hat0 = model(x0)
-            val_loss = float(loss_fn(y_hat0, y0).item())
+        x = x.to(device)
+        y = y.to(device)
+        last_lr = _learning_rate(
+            update_index,
+            total_updates=updates,
+            warmup_updates=warmup_updates,
+            peak_lr=peak_lr,
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = last_lr
 
-        if val_loss < best:
-            best = val_loss
-            torch.save({"model": model.state_dict(), "network_config": network_config, "spatial_dim": spatial_dim, "num_channels": num_channels, "num_points": num_points}, best_path)
+        prediction = model(x)
+        loss = loss_fn(prediction, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        last_loss = float(loss.item())
 
-        with open(state_path, "w", encoding="utf-8") as f:
-            json.dump({"epoch": ep, "train_loss": train_loss, "val_loss": val_loss, "best_val": best}, f)
+        completed_updates = update_index + 1
+        if completed_updates % log_every == 0 or completed_updates == updates:
+            _write_json(
+                state_path,
+                {
+                    "completed_updates": completed_updates,
+                    "last_train_loss": last_loss,
+                    "last_learning_rate": last_lr,
+                    "checkpoint_policy": "final update only; no validation/test selection",
+                    "test_data_used_during_training": False,
+                },
+            )
 
-    print(best_path)
+    checkpoint = {
+        "format_version": 2,
+        "model_variant": "sgno_canonical",
+        "coordinate_mode": "legacy_raw_inclusive",
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "network_config": network_config,
+        "spatial_dim": spatial_dim,
+        "num_channels": num_channels,
+        "num_points": num_points,
+        "data_split": split_metadata,
+        "training_protocol": {
+            "objective": "one-step MSE",
+            "optimizer": "Adam",
+            "updates": updates,
+            "warmup_updates": warmup_updates,
+            "schedule": "linear warmup then cosine decay",
+            "peak_lr": peak_lr,
+            "batch_size": batch_size,
+            "seed": seed,
+            "optimizer_updates": updates,
+            "checkpoint_policy": "final update only; no validation/test selection",
+        },
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(os.fspath(checkpoint_path))
+
 
 if __name__ == "__main__":
     main()
