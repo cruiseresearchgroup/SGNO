@@ -27,3 +27,5 @@ __all__ = [
     "build_sgno_from_config",
     "summarize_gain_audit",
 ]
+
+from .model import build_model, model_config, model_spec

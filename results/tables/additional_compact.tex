@@ -1,0 +1,20 @@
+\begin{table}[!htbp]
+\centering
+\caption{\textbf{Additional objectives and model capacity.} GMean100,
+five-seed mean $\pm$ sample SD. SGNO, FNO(20), and IS-FNO(20) use 10k
+updates; Refiner-L uses 53.76M parameter-array elements and 50k updates. ---: not
+evaluated; NF$_{2/5}$: two non-finite seeds in steps 1--100.}
+\label{tab:training-protocol-controls}
+\begingroup\small
+\setlength{\tabcolsep}{3pt}\renewcommand{\arraystretch}{1.15}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lrrrr@{}}
+\toprule
+Task & SGNO & FNO(20) & IS-FNO(20) & PDE-Refiner-L \\
+\midrule
+KdV & \ms{0.0130}{0.0028} & \ms{0.163}{0.016} & \ms{0.0326}{0.0015} & --- \\
+KS & \ms{0.0565}{0.012} & \ms{0.843}{0.028} & \ms{0.127}{0.018} & \ms{0.00560}{0.00079} \\
+Burgers & \ms{0.00345}{0.00042} & \ms{0.0244}{0.0043} & \ms{0.00382}{0.00028} & \ms{0.00332}{0.0015} \\
+Kolmogorov & \ms{0.441}{0.035} & \ms{0.744}{0.015} & $\mathrm{NF}_{2/5}$ & --- \\
+\bottomrule
+\end{tabular*}\endgroup
+\end{table}

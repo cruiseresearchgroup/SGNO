@@ -1,0 +1,21 @@
+\begin{table}[!htbp]
+\centering\small
+\caption{\textbf{Fitted-only and jointly trained linear predictions.} GMean100; both columns are scaled by $10^{-6}$. Fitted-only is deterministic. SGNO reports the five-seed median after joint training.}
+\label{tab:linear-fitted-only}
+\setlength{\tabcolsep}{8pt}\renewcommand{\arraystretch}{1.15}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lrr@{}}
+\toprule
+Linear task & Fitted-only & SGNO \\
+\midrule
+Advection (1D) & $6.20$ & $2.54$ \\
+Diffusion (1D) & $7.21$ & $8.12$ \\
+Dispersion (1D) & $7.24$ & $5.01$ \\
+Mixed dispersion (2D) & $7.70$ & $6.06$ \\
+Axis diffusion (2D) & $8.53$ & $7.74$ \\
+Rotated diffusion (2D) & $8.35$ & $7.57$ \\
+Diagonal diffusion (3D) & $12.88$ & $5.80$ \\
+Unbalanced advection (3D) & $16.00$ & $5.77$ \\
+Advection--diffusion (3D) & $11.79$ & $7.11$ \\
+\bottomrule
+\end{tabular*}
+\end{table}

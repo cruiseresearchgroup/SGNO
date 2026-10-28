@@ -1,0 +1,63 @@
+{
+  "name": "Frozen 2D KdV-type resolution transfer",
+  "task": "dispconv2d_s1",
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "native_grid": 64,
+  "target_grids": [
+    32,
+    64,
+    128
+  ],
+  "test_ics": 30,
+  "horizon": 200,
+  "training_updates": 0,
+  "policies": [
+    "native64",
+    "frequency_direct",
+    "project_to64"
+  ],
+  "frequency_direct": {
+    "shared_parameters": "All original learned tensors are frozen, without resizing or fitting",
+    "linear_extension": "Reuse integer Fourier modes in the open native Nyquist band; zero multiplier outside abs(kx)<32 and ky<32 at N=128; native N=64 calls unchanged original implementation",
+    "offset_scaling": "Orthonormal FFT offset multiplied by target_N / 64 in two dimensions",
+    "filter": "Same physical wavenumber attenuation: frequency coordinate 2*k/64 at every target grid",
+    "runtime_changes": "Rebuild grid masks, spectral indexing, physical-frequency buffers and zero-input cache only",
+    "scope": "Explicit runtime extension convention, not an already verified native arbitrary-resolution implementation"
+  },
+  "project_to64": "Periodic Fourier resampling to 64, unchanged original model, Fourier resampling back at each step",
+  "reference": {
+    "physical_coefficients": "Convert original difficulty gammas/deltas at N=64 once, then fix normalized physical coefficients, domain length=1 and output dt=1 across grids",
+    "initial_conditions": "Same existing test ICs, periodically Fourier resampled",
+    "reference_grid": 128,
+    "substeps": 64,
+    "validation": "Three independent validation ICs (seed 250927), horizon 200; 128-grid 64-vs-128 substeps and 128-vs-256 spatial resolution at 128 substeps",
+    "gate": "Maximum per-time relative L2 discrepancy <= 0.01 in each comparison; fail closed, do not tune against model errors",
+    "projection": "Fourier resample reference128 onto each evaluation grid"
+  },
+  "metrics": [
+    "per_IC_per_step_nRMSE",
+    "GMean_1_100",
+    "GMean_101_200",
+    "nRMSE_200",
+    "one_step_nRMSE",
+    "failure_count"
+  ],
+  "aggregation": "Mean over all 30 ICs per step, then geometric mean over specified time window, separately for each training seed; no survivor-only averaging",
+  "checks": [
+    "checkpoint hash unchanged",
+    "learned tensor hash unchanged",
+    "strict checkpoint load",
+    "native64 adapter identity",
+    "original implementation shape probes",
+    "Fourier resampling analytic and scipy agreement",
+    "original64 replay comparison",
+    "physical coefficient conversion equality"
+  ],
+  "interpretation": "Can establish empirical transfer for these grids and this PDE only; does not prove arbitrary discretization, geometry or parameter generalization"
+}

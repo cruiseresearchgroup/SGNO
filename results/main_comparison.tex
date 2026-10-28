@@ -1,0 +1,32 @@
+\begin{table}[!b]
+\centering
+\caption{\textbf{Main prediction accuracy.} Median GMean100 over five seeds; lower is better. Bold: lowest median. All seed values and mean $\pm$ SD: Appendix~\ref{app:full_comparison}.}
+\label{tab:main-comparison}
+\begingroup\small
+\setlength{\tabcolsep}{2.3pt}\renewcommand{\arraystretch}{1.14}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lrrrrr@{}}
+\toprule
+Task & FNO & CNO & KNO & IS-FNO(1) & SGNO \\
+\midrule
+\multicolumn{6}{l}{\textit{Linear dynamics}} \\
+Advection (1D) & $0.0236$ & $0.854$ & $0.0280$ & $\mathrm{NF}_{1/5}$ & $\mathbf{2.54\mathrm{e}{-6}}$ \\
+Diffusion (1D) & $0.0198$ & $0.207$ & $0.0274$ & $1.64\mathrm{e}{-4}$ & $\mathbf{8.12\mathrm{e}{-6}}$ \\
+Dispersion (1D) & $0.0322$ & $0.265$ & $0.0277$ & $4.87\mathrm{e}{-5}$ & $\mathbf{5.01\mathrm{e}{-6}}$ \\
+Mixed dispersion (2D) & $0.186$ & $0.0516$ & $0.167$ & $0.00122$ & $\mathbf{6.06\mathrm{e}{-6}}$ \\
+Axis diffusion (2D) & $0.0804$ & $0.309$ & $0.0172$ & $0.00354$ & $\mathbf{7.74\mathrm{e}{-6}}$ \\
+Rotated diffusion (2D) & $0.0783$ & $0.319$ & $0.0461$ & $0.0123$ & $\mathbf{7.57\mathrm{e}{-6}}$ \\
+Diagonal diffusion (3D) & $0.166$ & $0.331$ & $0.0198$ & --- & $\mathbf{5.80\mathrm{e}{-6}}$ \\
+Unbalanced advection (3D) & $0.784$ & $0.134$ & $0.0432$ & --- & $\mathbf{5.77\mathrm{e}{-6}}$ \\
+Advection--diffusion (3D) & $0.144$ & $1.44$ & $0.0171$ & --- & $\mathbf{7.11\mathrm{e}{-6}}$ \\
+\midrule
+\multicolumn{6}{l}{\textit{Nonlinear dynamics}} \\
+KdV (1D) & $0.194$ & $0.473$ & $0.0908$ & $0.0466$ & $\mathbf{0.0122}$ \\
+KS (1D) & $0.516$ & $0.360$ & $0.307$ & $0.0800$ & $\mathbf{0.0512}$ \\
+Burgers (1D) & $0.0185$ & $0.293$ & $0.0196$ & $0.00584$ & $\mathbf{0.00334}$ \\
+Kolmogorov (2D) & $0.666$ & $0.494$ & $0.976$ & $0.552$ & $\mathbf{0.430}$ \\
+\bottomrule
+\end{tabular*}\endgroup
+\par\smallskip\begin{minipage}{\linewidth}\footnotesize
+NF$_{1/5}$: one non-finite seed in steps 1--100; ---: not evaluated.
+\end{minipage}
+\end{table}

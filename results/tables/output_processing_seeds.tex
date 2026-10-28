@@ -1,0 +1,35 @@
+\begingroup\small
+\setlength{\tabcolsep}{2.3pt}\renewcommand{\arraystretch}{1.1}
+\setlength{\LTleft}{\fill}\setlength{\LTright}{\fill}\setlength{\LTcapwidth}{\linewidth}
+\begin{longtable}{@{}lrrrrrrrr@{}}
+\caption{\textbf{SGNO output-processing controls.} GMean100 after retraining with the output filter, high-frequency zero-input subtraction, or both removed. All values are unscaled; SD is the sample standard deviation.}\label{tab:output-processing}\\
+\toprule Setting & Median & Mean & SD & \multicolumn{5}{c}{Training run} \\
+\cmidrule(l){5-9} & & & & A & B & C & D & E \\ \midrule
+\endfirsthead
+\multicolumn{9}{l}{\tablename\ \thetable\ (continued)}\\
+\toprule Setting & Median & Mean & SD & A & B & C & D & E \\ \midrule
+\endhead
+\midrule\multicolumn{9}{r}{Continued on the next page}\\\endfoot
+\bottomrule\endlastfoot
+\addlinespace[4pt]\multicolumn{9}{l}{\textit{KdV}}\\*
+Complete & $0.0122$ & $0.0129$ & $0.00264$ & $0.0122$ & $0.0131$ & $0.0172$ & $0.0103$ & $0.0115$ \\
+No filter & $0.0122$ & $0.0129$ & $0.00263$ & $0.0122$ & $0.0131$ & $0.0172$ & $0.0103$ & $0.0116$ \\
+No subtraction & $0.0124$ & $0.0132$ & $0.00306$ & $0.0124$ & $0.0134$ & $0.0184$ & $0.0106$ & $0.0113$ \\
+Neither & $0.0124$ & $0.0132$ & $0.00312$ & $0.0124$ & $0.0134$ & $0.0185$ & $0.0106$ & $0.0113$ \\
+\addlinespace[4pt]\multicolumn{9}{l}{\textit{KS}}\\*
+Complete & $0.0512$ & $0.0566$ & $0.0124$ & $0.0772$ & $0.0586$ & $0.0457$ & $0.05$ & $0.0512$ \\
+No filter & $0.0512$ & $0.0565$ & $0.0123$ & $0.0769$ & $0.0586$ & $0.0456$ & $0.05$ & $0.0512$ \\
+No subtraction & $0.0514$ & $0.0563$ & $0.012$ & $0.076$ & $0.0588$ & $0.0453$ & $0.0501$ & $0.0514$ \\
+Neither & $0.0516$ & $0.0563$ & $0.0119$ & $0.0758$ & $0.0586$ & $0.0453$ & $0.0501$ & $0.0516$ \\
+\addlinespace[4pt]\multicolumn{9}{l}{\textit{Burgers}}\\*
+Complete & $0.00334$ & $0.00357$ & $0.000563$ & $0.00321$ & $0.00313$ & $0.00334$ & $0.00369$ & $0.00451$ \\
+No filter & $0.00333$ & $0.00358$ & $0.000561$ & $0.00323$ & $0.00313$ & $0.00333$ & $0.00369$ & $0.0045$ \\
+No subtraction & $0.00346$ & $0.0036$ & $0.000468$ & $0.00326$ & $0.00315$ & $0.00346$ & $0.00379$ & $0.00431$ \\
+Neither & $0.00346$ & $0.00359$ & $0.000472$ & $0.00325$ & $0.00315$ & $0.00346$ & $0.0038$ & $0.00431$ \\
+\addlinespace[4pt]\multicolumn{9}{l}{\textit{Kolmogorov}}\\*
+Complete & $0.43$ & $0.441$ & $0.0343$ & $0.467$ & $0.404$ & $0.418$ & $0.43$ & $0.486$ \\
+No filter & $0.429$ & $0.441$ & $0.0334$ & $0.467$ & $0.405$ & $0.418$ & $0.429$ & $0.485$ \\
+No subtraction & $0.43$ & $0.443$ & $0.0386$ & $0.465$ & $0.402$ & $0.418$ & $0.43$ & $0.498$ \\
+Neither & $0.43$ & $0.448$ & $0.0466$ & $0.466$ & $0.403$ & $0.419$ & $0.43$ & $0.52$ \\
+\end{longtable}
+\endgroup

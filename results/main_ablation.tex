@@ -1,0 +1,27 @@
+\begin{table}[!htbp]
+\centering
+\caption{\textbf{Contributions of estimation and correction.} Median GMean100 over five seeds. The fitted-only map is deterministic. Bold compares the four matched initialization/adaptation controls; Burgers is scaled by $10^{-3}$. Full seed statistics: Appendix~\ref{app:ablation_results}.}
+\label{tab:main-ablation}
+\begingroup\small
+\setlength{\tabcolsep}{2pt}\renewcommand{\arraystretch}{1.05}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lrrrr@{}}
+\toprule
+Setting & KdV & KS & Burgers & Kolmogorov \\
+\midrule
+Fitted map only & $0.841$ & $0.763$ & $523$ & $0.840$ \\
+\addlinespace[2pt]\multicolumn{5}{l}{\textit{Matched controls: same SGNO corrector; direct-complex maps}} \\
+Fixed identity & $0.0165$ & $0.0541$ & $3.63$ & $0.493$ \\
+Trainable identity & $0.0143$ & $0.0498$ & $3.56$ & $0.445$ \\
+Fixed fitted map & $0.0129$ & $0.0529$ & $3.68$ & $0.480$ \\
+Trainable fitted & $\mathbf{0.0121}$ & $\mathbf{0.0477}$ & $\mathbf{3.38}$ & $\mathbf{0.427}$ \\
+\midrule
+\multicolumn{5}{l}{\textit{Original SGNO parameterization and layer-path interventions}} \\
+SGNO & $0.0122$ & $0.0512$ & $3.34$ & $0.430$ \\
+No spectral source & $173$ & $0.241$ & --- & --- \\
+No affine path & $0.0105$ & $0.0640$ & --- & --- \\
+\bottomrule
+\end{tabular*}\endgroup
+\par\smallskip\begin{minipage}{\linewidth}\footnotesize
+Trainable controls use unit-disk projection; original SGNO uses the radial-square parameterization. The removed affine path is the pointwise map within each correction layer. ---: not evaluated.
+\end{minipage}
+\end{table}

@@ -1,0 +1,31 @@
+{
+  "batch_size": 20,
+  "betas": [
+    0.9,
+    0.999
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0.0,
+  "updates": 10000,
+  "warmup": 2000,
+  "peak_lr": 0.001,
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "model": "sgno_zero_head_increment_v1",
+  "model_selection": "fixed final update",
+  "objective": "one-step next-state MSE",
+  "training_tf32": {
+    "matmul": false,
+    "cudnn": true
+  },
+  "evaluation_tf32": {
+    "matmul": false,
+    "cudnn": false
+  },
+  "precision": "float32/complex64"
+}

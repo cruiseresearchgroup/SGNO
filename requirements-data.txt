@@ -1,0 +1,16 @@
+# Install in a separate Python 3.10/3.11 environment.
+numpy==1.24.2
+jax==0.4.35
+jaxlib==0.4.34
+equinox==0.11.10
+optax==0.2.4
+exponax==0.1.0
+pdequinox==0.1.2
+trainax==0.0.2
+scipy==1.15.3
+jaxtyping==0.2.36
+typing_extensions==4.12.2
+tqdm==4.67.1
+matplotlib==3.8.4
+pandas==2.2.3
+seaborn==0.13.2

@@ -58,7 +58,7 @@ def _project_rfft_hermitian_boundaries(
     if tuple(spectrum.shape[-len(shape) :]) != expected_spectral_shape:
         raise ValueError(
             "stored rFFT shape does not match the requested spatial shape: "
-            f"got {tuple(spectrum.shape[-len(shape):])}, expected {expected_spectral_shape}"
+            f"got {tuple(spectrum.shape[-len(shape) :])}, expected {expected_spectral_shape}"
         )
 
     boundaries = [0]
@@ -79,7 +79,9 @@ def _project_rfft_hermitian_boundaries(
             partner = partner.index_select(first_full_axis + offset, indices)
         projected_planes.append(0.5 * (plane + partner.conj()))
 
-    boundary_indices = torch.tensor(boundaries, device=spectrum.device, dtype=torch.long)
+    boundary_indices = torch.tensor(
+        boundaries, device=spectrum.device, dtype=torch.long
+    )
     source = torch.stack(projected_planes, dim=-1)
     return torch.index_copy(spectrum, -1, boundary_indices, source)
 
@@ -100,12 +102,16 @@ def _radial_coord_nd(shape, device, dtype=torch.float32):
     return torch.sqrt(r2 + 1e-12) / math.sqrt(float(len(shape)))
 
 
-def _nonnegative_radial_profile(radius: torch.Tensor, bias_raw: torch.Tensor, slope_raw: torch.Tensor):
+def _nonnegative_radial_profile(
+    radius: torch.Tensor, bias_raw: torch.Tensor, slope_raw: torch.Tensor
+):
     slope = F.softplus(slope_raw)
     return F.softplus(bias_raw - slope * radius)
 
 
-def _unit_centered_radial_budget(radius: torch.Tensor, bias: torch.Tensor, slope_raw: torch.Tensor):
+def _unit_centered_radial_budget(
+    radius: torch.Tensor, bias: torch.Tensor, slope_raw: torch.Tensor
+):
     slope = F.softplus(slope_raw)
     return 2.0 * torch.sigmoid(bias - slope * radius)
 
@@ -180,13 +186,21 @@ class SpectralETD1d(nn.Module):
 
         self.log_decay = nn.Parameter(torch.randn(channels, modes1) * 0.1)
         scale = 1.0 / (channels * channels)
-        self.mix = nn.Parameter(scale * torch.rand(channels, channels, modes1, dtype=torch.cfloat))
+        self.mix = nn.Parameter(
+            scale * torch.rand(channels, channels, modes1, dtype=torch.cfloat)
+        )
 
         tiny = _inv_softplus(1e-3)
-        self.damp_bias_raw = nn.Parameter(torch.full((channels, 1), tiny, dtype=torch.float32))
-        self.damp_slope_raw = nn.Parameter(torch.full((channels, 1), tiny, dtype=torch.float32))
+        self.damp_bias_raw = nn.Parameter(
+            torch.full((channels, 1), tiny, dtype=torch.float32)
+        )
+        self.damp_slope_raw = nn.Parameter(
+            torch.full((channels, 1), tiny, dtype=torch.float32)
+        )
         self.inj_bias = nn.Parameter(torch.zeros(channels, 1, dtype=torch.float32))
-        self.inj_slope_raw = nn.Parameter(torch.full((channels, 1), tiny, dtype=torch.float32))
+        self.inj_slope_raw = nn.Parameter(
+            torch.full((channels, 1), tiny, dtype=torch.float32)
+        )
 
     def _damping_profile(self, device):
         radius = _radial_coord_nd((self.modes1,), device=device).view(1, self.modes1)
@@ -215,7 +229,9 @@ class SpectralETD1d(nn.Module):
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         if g.shape != v.shape:
-            raise ValueError(f"v and g must have the same shape, got {v.shape} and {g.shape}")
+            raise ValueError(
+                f"v and g must have the same shape, got {v.shape} and {g.shape}"
+            )
         _, c, x_size = v.shape
         if c != self.channels:
             raise ValueError(f"expected {self.channels} channels, got {c}")
@@ -260,17 +276,29 @@ class SpectralETD2d(nn.Module):
         self.log_decay_neg = nn.Parameter(torch.randn(channels, modes1, modes2) * 0.1)
 
         scale = 1.0 / math.sqrt(channels)
-        self.mix_pos = nn.Parameter(scale * torch.randn(channels, channels, modes1, modes2, dtype=torch.cfloat))
-        self.mix_neg = nn.Parameter(scale * torch.randn(channels, channels, modes1, modes2, dtype=torch.cfloat))
+        self.mix_pos = nn.Parameter(
+            scale * torch.randn(channels, channels, modes1, modes2, dtype=torch.cfloat)
+        )
+        self.mix_neg = nn.Parameter(
+            scale * torch.randn(channels, channels, modes1, modes2, dtype=torch.cfloat)
+        )
 
         tiny = _inv_softplus(1e-3)
-        self.damp_bias_raw = nn.Parameter(torch.full((channels, 1, 1), tiny, dtype=torch.float32))
-        self.damp_slope_raw = nn.Parameter(torch.full((channels, 1, 1), tiny, dtype=torch.float32))
+        self.damp_bias_raw = nn.Parameter(
+            torch.full((channels, 1, 1), tiny, dtype=torch.float32)
+        )
+        self.damp_slope_raw = nn.Parameter(
+            torch.full((channels, 1, 1), tiny, dtype=torch.float32)
+        )
         self.inj_bias = nn.Parameter(torch.zeros(channels, 1, 1, dtype=torch.float32))
-        self.inj_slope_raw = nn.Parameter(torch.full((channels, 1, 1), tiny, dtype=torch.float32))
+        self.inj_slope_raw = nn.Parameter(
+            torch.full((channels, 1, 1), tiny, dtype=torch.float32)
+        )
 
     def _damping_profile(self, device):
-        radius = _radial_coord_nd((self.modes1, self.modes2), device=device).view(1, self.modes1, self.modes2)
+        radius = _radial_coord_nd((self.modes1, self.modes2), device=device).view(
+            1, self.modes1, self.modes2
+        )
         return _nonnegative_radial_profile(
             radius,
             self.damp_bias_raw.to(device=device),
@@ -278,7 +306,9 @@ class SpectralETD2d(nn.Module):
         )
 
     def _injection_budget(self, device):
-        radius = _radial_coord_nd((self.modes1, self.modes2), device=device).view(1, self.modes1, self.modes2)
+        radius = _radial_coord_nd((self.modes1, self.modes2), device=device).view(
+            1, self.modes1, self.modes2
+        )
         return _unit_centered_radial_budget(
             radius,
             self.inj_bias.to(device=device),
@@ -298,7 +328,9 @@ class SpectralETD2d(nn.Module):
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         if g.shape != v.shape:
-            raise ValueError(f"v and g must have the same shape, got {v.shape} and {g.shape}")
+            raise ValueError(
+                f"v and g must have the same shape, got {v.shape} and {g.shape}"
+            )
         _, c, x_size, y_size = v.shape
         if c != self.channels:
             raise ValueError(f"expected {self.channels} channels, got {c}")
@@ -324,19 +356,25 @@ class SpectralETD2d(nn.Module):
         z_pos = (_CANONICAL_DT * lam_pos).unsqueeze(0)
         z_neg = (_CANONICAL_DT * lam_neg).unsqueeze(0)
 
-        budget = self._injection_budget(v.device)[:, :m1, :m2].view(1, self.channels, m1, m2)
+        budget = self._injection_budget(v.device)[:, :m1, :m2].view(
+            1, self.channels, m1, m2
+        )
 
         vp = v_hat[:, :, :m1, :m2]
         gp = g_hat[:, :, :m1, :m2]
         mixp = self._project_mix(self.mix_pos.to(device=v.device))[:, :, :m1, :m2]
         gmp = torch.einsum("bixy,ioxy->boxy", gp, mixp)
-        out_hat[:, :, :m1, :m2] = torch.exp(z_pos) * vp + (_CANONICAL_DT * _phi1(z_pos)) * gmp * budget
+        out_hat[:, :, :m1, :m2] = (
+            torch.exp(z_pos) * vp + (_CANONICAL_DT * _phi1(z_pos)) * gmp * budget
+        )
 
         vn = v_hat[:, :, -m1:, :m2]
         gn = g_hat[:, :, -m1:, :m2]
         mixn = self._project_mix(self.mix_neg.to(device=v.device))[:, :, :m1, :m2]
         gmn = torch.einsum("bixy,ioxy->boxy", gn, mixn)
-        out_hat[:, :, -m1:, :m2] = torch.exp(z_neg) * vn + (_CANONICAL_DT * _phi1(z_neg)) * gmn * budget
+        out_hat[:, :, -m1:, :m2] = (
+            torch.exp(z_neg) * vn + (_CANONICAL_DT * _phi1(z_neg)) * gmn * budget
+        )
 
         # irfft2 implicitly applies the Hermitian boundary projection P_H.
         return torch.fft.irfft2(out_hat, s=(x_size, y_size))
@@ -360,19 +398,41 @@ class SpectralETD3d(nn.Module):
         self.log_decay4 = nn.Parameter(torch.randn(*shape) * 0.1)
 
         scale = 1.0 / (channels * channels)
-        self.mix1 = nn.Parameter(scale * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat))
-        self.mix2 = nn.Parameter(scale * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat))
-        self.mix3 = nn.Parameter(scale * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat))
-        self.mix4 = nn.Parameter(scale * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat))
+        self.mix1 = nn.Parameter(
+            scale
+            * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat)
+        )
+        self.mix2 = nn.Parameter(
+            scale
+            * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat)
+        )
+        self.mix3 = nn.Parameter(
+            scale
+            * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat)
+        )
+        self.mix4 = nn.Parameter(
+            scale
+            * torch.rand(channels, channels, modes1, modes2, modes3, dtype=torch.cfloat)
+        )
 
         tiny = _inv_softplus(1e-3)
-        self.damp_bias_raw = nn.Parameter(torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32))
-        self.damp_slope_raw = nn.Parameter(torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32))
-        self.inj_bias = nn.Parameter(torch.zeros(channels, 1, 1, 1, dtype=torch.float32))
-        self.inj_slope_raw = nn.Parameter(torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32))
+        self.damp_bias_raw = nn.Parameter(
+            torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32)
+        )
+        self.damp_slope_raw = nn.Parameter(
+            torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32)
+        )
+        self.inj_bias = nn.Parameter(
+            torch.zeros(channels, 1, 1, 1, dtype=torch.float32)
+        )
+        self.inj_slope_raw = nn.Parameter(
+            torch.full((channels, 1, 1, 1), tiny, dtype=torch.float32)
+        )
 
     def _damping_profile(self, device):
-        radius = _radial_coord_nd((self.modes1, self.modes2, self.modes3), device=device).view(
+        radius = _radial_coord_nd(
+            (self.modes1, self.modes2, self.modes3), device=device
+        ).view(
             1,
             self.modes1,
             self.modes2,
@@ -385,7 +445,9 @@ class SpectralETD3d(nn.Module):
         )
 
     def _injection_budget(self, device):
-        radius = _radial_coord_nd((self.modes1, self.modes2, self.modes3), device=device).view(
+        radius = _radial_coord_nd(
+            (self.modes1, self.modes2, self.modes3), device=device
+        ).view(
             1,
             self.modes1,
             self.modes2,
@@ -407,7 +469,9 @@ class SpectralETD3d(nn.Module):
 
     def forward(self, v: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         if g.shape != v.shape:
-            raise ValueError(f"v and g must have the same shape, got {v.shape} and {g.shape}")
+            raise ValueError(
+                f"v and g must have the same shape, got {v.shape} and {g.shape}"
+            )
         _, c, x_size, y_size, z_size = v.shape
         if c != self.channels:
             raise ValueError(f"expected {self.channels} channels, got {c}")
@@ -428,7 +492,9 @@ class SpectralETD3d(nn.Module):
         m1 = self.modes1
         m2 = self.modes2
         m3 = self.modes3
-        budget = self._injection_budget(v.device)[:, :m1, :m2, :m3].view(1, self.channels, m1, m2, m3)
+        budget = self._injection_budget(v.device)[:, :m1, :m2, :m3].view(
+            1, self.channels, m1, m2, m3
+        )
 
         def apply_block(vs, gs, lam, mix):
             zc = (_CANONICAL_DT * lam).unsqueeze(0)
@@ -471,7 +537,14 @@ class SpectralETD3d(nn.Module):
 
 
 class SGNO1d(nn.Module):
-    def __init__(self, num_channels: int, modes: int = 16, width: int = 64, initial_step: int = 1, n_blocks: int = 4):
+    def __init__(
+        self,
+        num_channels: int,
+        modes: int = 16,
+        width: int = 64,
+        initial_step: int = 1,
+        n_blocks: int = 4,
+    ):
         super().__init__()
         self.modes1 = int(modes)
         self.width = int(width)
@@ -480,9 +553,15 @@ class SGNO1d(nn.Module):
         self.padding = 0
 
         self.fc0 = nn.Linear(self.initial_step * num_channels + 1, self.width)
-        self.gs = nn.ModuleList([PointwiseMLP1d(self.width) for _ in range(self.n_blocks)])
-        self.etds = nn.ModuleList([SpectralETD1d(self.width, self.modes1) for _ in range(self.n_blocks)])
-        self.bs = nn.ModuleList([nn.Conv1d(self.width, self.width, 1) for _ in range(self.n_blocks)])
+        self.gs = nn.ModuleList(
+            [PointwiseMLP1d(self.width) for _ in range(self.n_blocks)]
+        )
+        self.etds = nn.ModuleList(
+            [SpectralETD1d(self.width, self.modes1) for _ in range(self.n_blocks)]
+        )
+        self.bs = nn.ModuleList(
+            [nn.Conv1d(self.width, self.width, 1) for _ in range(self.n_blocks)]
+        )
         self.fc1 = nn.Linear(self.width, _HEAD_WIDTH)
         self.fc2 = nn.Linear(_HEAD_WIDTH, num_channels)
 
@@ -516,9 +595,18 @@ class SGNO2d(nn.Module):
         self.padding = 0
 
         self.fc0 = nn.Linear(self.initial_step * num_channels + 2, self.width)
-        self.gs = nn.ModuleList([PointwiseMLP2d(self.width) for _ in range(self.n_blocks)])
-        self.etds = nn.ModuleList([SpectralETD2d(self.width, self.modes1, self.modes2) for _ in range(self.n_blocks)])
-        self.bs = nn.ModuleList([nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_blocks)])
+        self.gs = nn.ModuleList(
+            [PointwiseMLP2d(self.width) for _ in range(self.n_blocks)]
+        )
+        self.etds = nn.ModuleList(
+            [
+                SpectralETD2d(self.width, self.modes1, self.modes2)
+                for _ in range(self.n_blocks)
+            ]
+        )
+        self.bs = nn.ModuleList(
+            [nn.Conv2d(self.width, self.width, 1) for _ in range(self.n_blocks)]
+        )
         self.fc1 = nn.Linear(self.width, _HEAD_WIDTH)
         self.fc2 = nn.Linear(_HEAD_WIDTH, num_channels)
 
@@ -554,11 +642,18 @@ class SGNO3d(nn.Module):
         self.padding = 0
 
         self.fc0 = nn.Linear(self.initial_step * num_channels + 3, self.width)
-        self.gs = nn.ModuleList([PointwiseMLP3d(self.width) for _ in range(self.n_blocks)])
-        self.etds = nn.ModuleList(
-            [SpectralETD3d(self.width, self.modes1, self.modes2, self.modes3) for _ in range(self.n_blocks)]
+        self.gs = nn.ModuleList(
+            [PointwiseMLP3d(self.width) for _ in range(self.n_blocks)]
         )
-        self.bs = nn.ModuleList([nn.Conv3d(self.width, self.width, 1) for _ in range(self.n_blocks)])
+        self.etds = nn.ModuleList(
+            [
+                SpectralETD3d(self.width, self.modes1, self.modes2, self.modes3)
+                for _ in range(self.n_blocks)
+            ]
+        )
+        self.bs = nn.ModuleList(
+            [nn.Conv3d(self.width, self.width, 1) for _ in range(self.n_blocks)]
+        )
         self.fc1 = nn.Linear(self.width, _HEAD_WIDTH)
         self.fc2 = nn.Linear(_HEAD_WIDTH, num_channels)
 
@@ -574,7 +669,9 @@ class SGNO3d(nn.Module):
 
 
 def _make_grid_1d(batch: int, x_size: int, device, dtype):
-    x = torch.linspace(0.0, 1.0, steps=x_size, device=device, dtype=dtype).view(1, x_size, 1)
+    x = torch.linspace(0.0, 1.0, steps=x_size, device=device, dtype=dtype).view(
+        1, x_size, 1
+    )
     return x.expand(batch, x_size, 1)
 
 
@@ -617,7 +714,11 @@ class SGNOTorchApeWrapper(nn.Module):
                 if steps != self.initial_step:
                     raise ValueError("history length must equal initial_step")
                 base = u[:, -1].contiguous()
-                x = u.permute(0, 3, 2, 1).contiguous().view(batch, x_size, channels * steps)
+                x = (
+                    u.permute(0, 3, 2, 1)
+                    .contiguous()
+                    .view(batch, x_size, channels * steps)
+                )
             else:
                 raise ValueError("1D input must have shape B C X or B T C X")
             grid = _make_grid_1d(x.shape[0], x.shape[1], device, dtype)
@@ -635,7 +736,11 @@ class SGNOTorchApeWrapper(nn.Module):
                 if steps != self.initial_step:
                     raise ValueError("history length must equal initial_step")
                 base = u[:, -1].contiguous()
-                x = u.permute(0, 3, 4, 2, 1).contiguous().view(batch, x_size, y_size, channels * steps)
+                x = (
+                    u.permute(0, 3, 4, 2, 1)
+                    .contiguous()
+                    .view(batch, x_size, y_size, channels * steps)
+                )
             else:
                 raise ValueError("2D input must have shape B C X Y or B T C X Y")
             grid = _make_grid_2d(x.shape[0], x.shape[1], x.shape[2], device, dtype)
@@ -653,16 +758,22 @@ class SGNOTorchApeWrapper(nn.Module):
                 if steps != self.initial_step:
                     raise ValueError("history length must equal initial_step")
                 base = u[:, -1].contiguous()
-                x = u.permute(0, 3, 4, 5, 2, 1).contiguous().view(
-                    batch,
-                    x_size,
-                    y_size,
-                    z_size,
-                    channels * steps,
+                x = (
+                    u.permute(0, 3, 4, 5, 2, 1)
+                    .contiguous()
+                    .view(
+                        batch,
+                        x_size,
+                        y_size,
+                        z_size,
+                        channels * steps,
+                    )
                 )
             else:
                 raise ValueError("3D input must have shape B C X Y Z or B T C X Y Z")
-            grid = _make_grid_3d(x.shape[0], x.shape[1], x.shape[2], x.shape[3], device, dtype)
+            grid = _make_grid_3d(
+                x.shape[0], x.shape[1], x.shape[2], x.shape[3], device, dtype
+            )
             delta = self.core(x, grid).squeeze(-2).permute(0, 4, 1, 2, 3).contiguous()
             return base + delta.to(dtype=base.dtype)
 
@@ -799,11 +910,19 @@ def summarize_gain_audit(model: nn.Module) -> Dict[str, Any]:
             gamma_vals.extend(_flatten_tensor(-lam_neg.real))
             adaptive_budget_vals.extend(_flatten_tensor(etd._injection_budget("cpu")))
             adaptive_damp_vals.extend(_flatten_tensor(etd._damping_profile("cpu")))
-            for mix in [etd._project_mix(etd.mix_pos.to("cpu")), etd._project_mix(etd.mix_neg.to("cpu"))]:
+            for mix in [
+                etd._project_mix(etd.mix_pos.to("cpu")),
+                etd._project_mix(etd.mix_neg.to("cpu")),
+            ]:
                 mats = mix.permute(2, 3, 0, 1).reshape(-1, etd.channels, etd.channels)
                 mu_vals.extend(_flatten_tensor(torch.linalg.matrix_norm(mats, ord=2)))
         elif isinstance(etd, SpectralETD3d):
-            for log_decay in [etd.log_decay1, etd.log_decay2, etd.log_decay3, etd.log_decay4]:
+            for log_decay in [
+                etd.log_decay1,
+                etd.log_decay2,
+                etd.log_decay3,
+                etd.log_decay4,
+            ]:
                 lam = etd._lam_block(log_decay.detach().cpu(), "cpu")
                 gamma_vals.extend(_flatten_tensor(-lam.real))
             adaptive_budget_vals.extend(_flatten_tensor(etd._injection_budget("cpu")))
@@ -814,7 +933,9 @@ def summarize_gain_audit(model: nn.Module) -> Dict[str, Any]:
                 etd._project_mix(etd.mix3.to("cpu")),
                 etd._project_mix(etd.mix4.to("cpu")),
             ]:
-                mats = mix.permute(2, 3, 4, 0, 1).reshape(-1, etd.channels, etd.channels)
+                mats = mix.permute(2, 3, 4, 0, 1).reshape(
+                    -1, etd.channels, etd.channels
+                )
                 mu_vals.extend(_flatten_tensor(torch.linalg.matrix_norm(mats, ord=2)))
 
     for g in gs:
@@ -831,7 +952,10 @@ def summarize_gain_audit(model: nn.Module) -> Dict[str, Any]:
         l_n = max(forcing_norm_vals)
         for etd in etds:
             dt = float(etd.dt)
-            q = math.exp(-gamma_min * dt) + mu_max * l_n * (1.0 - math.exp(-gamma_min * dt)) / gamma_min
+            q = (
+                math.exp(-gamma_min * dt)
+                + mu_max * l_n * (1.0 - math.exp(-gamma_min * dt)) / gamma_min
+            )
             q_delta_vals.append(float(q))
 
     q_delta_summary = _summary_stats(q_delta_vals)
@@ -851,4 +975,3 @@ def summarize_gain_audit(model: nn.Module) -> Dict[str, Any]:
         "q_delta_heuristic": q_delta_summary,
         "q_delta": q_delta_summary,
     }
-

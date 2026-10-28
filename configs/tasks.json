@@ -1,0 +1,305 @@
+{
+  "adv1d": {
+    "id": "adv1d",
+    "N": 160,
+    "ndim": 1,
+    "dt": 1,
+    "time_unit": "normalized_output_step",
+    "train_shape": [
+      50,
+      51,
+      1,
+      160
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      160
+    ],
+    "linear": true,
+    "data_file": "data/adv1d.npz",
+    "generator": "anchors"
+  },
+  "diff1d": {
+    "id": "diff1d",
+    "N": 160,
+    "ndim": 1,
+    "dt": 1,
+    "time_unit": "normalized_output_step",
+    "train_shape": [
+      50,
+      51,
+      1,
+      160
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      160
+    ],
+    "linear": true,
+    "data_file": "data/diff1d.npz",
+    "generator": "anchors"
+  },
+  "disp1d": {
+    "id": "disp1d",
+    "N": 160,
+    "ndim": 1,
+    "dt": 1,
+    "time_unit": "normalized_output_step",
+    "train_shape": [
+      50,
+      51,
+      1,
+      160
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      160
+    ],
+    "linear": true,
+    "data_file": "data/disp1d.npz",
+    "generator": "anchors"
+  },
+  "kdv1d": {
+    "id": "kdv1d",
+    "N": 160,
+    "ndim": 1,
+    "dt": 1,
+    "time_unit": "normalized_output_step",
+    "train_shape": [
+      50,
+      51,
+      1,
+      160
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      160
+    ],
+    "linear": false,
+    "data_file": "data/kdv1d.npz",
+    "generator": "anchors"
+  },
+  "ks1d": {
+    "id": "ks1d",
+    "N": 160,
+    "ndim": 1,
+    "dt": 1,
+    "time_unit": "normalized_output_step",
+    "train_shape": [
+      50,
+      51,
+      1,
+      160
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      160
+    ],
+    "linear": false,
+    "data_file": "data/ks1d.npz",
+    "generator": "anchors"
+  },
+  "burgers1d_nu12e4": {
+    "id": "burgers1d_nu12e4",
+    "N": 160,
+    "ndim": 1,
+    "dt": 0.1,
+    "time_unit": "physical_time",
+    "train_shape": [
+      50,
+      51,
+      1,
+      160
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      160
+    ],
+    "linear": false,
+    "data_file": "data/burgers1d_nu12e4.npz",
+    "generator": "physical"
+  },
+  "mixdisp2d": {
+    "id": "mixdisp2d",
+    "N": 64,
+    "ndim": 2,
+    "dt": 0.001,
+    "time_unit": "physical_time",
+    "train_shape": [
+      50,
+      51,
+      1,
+      64,
+      64
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      64,
+      64
+    ],
+    "linear": true,
+    "data_file": "data/mixdisp2d.npz",
+    "generator": "anchors"
+  },
+  "anisodiff2d_axis": {
+    "id": "anisodiff2d_axis",
+    "N": 64,
+    "ndim": 2,
+    "dt": 0.1,
+    "time_unit": "physical_time",
+    "train_shape": [
+      50,
+      51,
+      1,
+      64,
+      64
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      64,
+      64
+    ],
+    "linear": true,
+    "data_file": "data/anisodiff2d_axis.npz",
+    "generator": "physical"
+  },
+  "anisodiff2d_rot45": {
+    "id": "anisodiff2d_rot45",
+    "N": 64,
+    "ndim": 2,
+    "dt": 0.1,
+    "time_unit": "physical_time",
+    "train_shape": [
+      50,
+      51,
+      1,
+      64,
+      64
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      64,
+      64
+    ],
+    "linear": true,
+    "data_file": "data/anisodiff2d_rot45.npz",
+    "generator": "physical"
+  },
+  "diagdiff3d": {
+    "id": "diagdiff3d",
+    "N": 32,
+    "ndim": 3,
+    "dt": 0.1,
+    "train_shape": [
+      50,
+      51,
+      1,
+      32,
+      32,
+      32
+    ],
+    "test_shape": [
+      10,
+      201,
+      1,
+      32,
+      32,
+      32
+    ],
+    "linear": true,
+    "data_file": "data/diagdiff3d.npz",
+    "generator": "anchors"
+  },
+  "unbaladv3d": {
+    "id": "unbaladv3d",
+    "N": 32,
+    "ndim": 3,
+    "dt": 0.1,
+    "train_shape": [
+      50,
+      51,
+      1,
+      32,
+      32,
+      32
+    ],
+    "test_shape": [
+      10,
+      201,
+      1,
+      32,
+      32,
+      32
+    ],
+    "linear": true,
+    "data_file": "data/unbaladv3d.npz",
+    "generator": "anchors"
+  },
+  "advdiff3d": {
+    "id": "advdiff3d",
+    "N": 32,
+    "ndim": 3,
+    "dt": 1.0,
+    "train_shape": [
+      50,
+      51,
+      1,
+      32,
+      32,
+      32
+    ],
+    "test_shape": [
+      10,
+      201,
+      1,
+      32,
+      32,
+      32
+    ],
+    "linear": true,
+    "data_file": "data/advdiff3d.npz",
+    "generator": "anchors"
+  },
+  "kolm2d": {
+    "id": "kolm2d",
+    "N": 64,
+    "ndim": 2,
+    "dt": 0.1,
+    "time_unit": "physical_time",
+    "train_shape": [
+      50,
+      51,
+      1,
+      64,
+      64
+    ],
+    "test_shape": [
+      30,
+      201,
+      1,
+      64,
+      64
+    ],
+    "linear": false,
+    "data_file": "data/kolm2d.npz",
+    "generator": "anchors"
+  }
+}

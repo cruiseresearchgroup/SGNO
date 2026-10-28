@@ -4,15 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgno"
-version = "0.1.0"
-description = "Spectral Generator Neural Operator in PyTorch"
+version = "1.1.0"
+description = "Spectral Generator Neural Operator for Long-Horizon PDE Prediction"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["torch", "numpy"]
-keywords = ["neural-operator", "pde", "fourier", "etd"]
+license = {file = "LICENSE"}
+dependencies = ["torch>=2.5", "numpy>=1.24", "matplotlib>=3.8"]
 
-[tool.setuptools]
-package-dir = {"" = "src"}
+[project.optional-dependencies]
+test = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

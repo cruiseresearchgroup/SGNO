@@ -1,0 +1,24 @@
+{
+  "checks": [
+    {
+      "ic": 0,
+      "temporal_max": 0.007298876820663856,
+      "spatial_max": 1.9617004747855622e-11,
+      "passed": true
+    },
+    {
+      "ic": 1,
+      "temporal_max": 0.007357379744957207,
+      "spatial_max": 1.1222133420987901e-10,
+      "passed": true
+    },
+    {
+      "ic": 2,
+      "temporal_max": 0.0040079296468577275,
+      "spatial_max": 8.833767715154057e-11,
+      "passed": true
+    }
+  ],
+  "passed": true,
+  "complete": true
+}
